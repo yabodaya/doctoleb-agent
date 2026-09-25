@@ -18,6 +18,7 @@ Read `docs/architecture.md` before any non-trivial change.
 - httpx for outbound HTTP (Meta, Booking Service)
 - OpenAI Python SDK (model names come from env vars, never hardcoded)
 - pytest + pytest-asyncio, ruff
+- uv for dependencies and virtualenvs (`pyproject.toml` + committed `uv.lock`; the uv version is pinned in the Dockerfile tag)
 - Docker Compose for local dev (api, worker, postgres, redis)
 
 ## Hard rules. Never violate these, even if asked mid-task.
