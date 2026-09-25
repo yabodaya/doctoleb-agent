@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-doctoleb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-doctoleb}
+      POSTGRES_DB: ${POSTGRES_DB:-doctoleb}
+    ports:
+      # Bound to the loopback interface, not 0.0.0.0. A bare "5432:5432" would
+      # expose a database with a known dev password to the whole local network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-doctoleb} -d ${POSTGRES_DB:-doctoleb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Loopback only. Redis has no auth configured here.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    ports:
+      # Loopback only, like postgres and redis. Tunnels (ngrok, cloudflared) run
+      # on the host and reach the api through localhost, and WhatsApp webhooks
+      # arrive through the tunnel, so nothing needs LAN access to this port.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Bind-mount the source so --reload picks up edits without a rebuild.
+      - ./app:/srv/app
+      - ./tests:/srv/tests
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: arq app.worker.main.WorkerSettings
+    env_file: .env
+    volumes:
+      - ./app:/srv/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

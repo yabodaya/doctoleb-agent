@@ -3,7 +3,7 @@ Work in order. Set exactly one slice to IN PROGRESS at a time.
 
 | Slice | Name | Status |
 |---|---|---|
-| VS-001 | Project skeleton | TODO |
+| VS-001 | Project skeleton | DONE |
 | VS-002 | Messaging database | TODO |
 | VS-003 | Receive WhatsApp webhook | TODO |
 | VS-004 | Worker + send reply | TODO |
