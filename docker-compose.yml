@@ -41,6 +41,12 @@ services:
       # Bind-mount the source so --reload picks up edits without a rebuild.
       - ./app:/srv/app
       - ./tests:/srv/tests
+      # Without these two, `alembic revision --autogenerate` inside the
+      # container writes the new revision into the container's own filesystem
+      # and it vanishes with the container. The mount is what puts the
+      # generated file on the host, where it can be reviewed and committed.
+      - ./migrations:/srv/migrations
+      - ./alembic.ini:/srv/alembic.ini
     depends_on:
       postgres:
         condition: service_healthy
