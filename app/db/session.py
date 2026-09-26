@@ -4,12 +4,20 @@ VS-001 needs this only so readiness can prove Postgres is reachable.
 VS-002 adds models, a session factory and repositories on the same engine.
 """
 
+from collections.abc import AsyncIterator
+
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.config import get_settings
 
 _engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
 def get_engine() -> AsyncEngine:
@@ -33,9 +41,30 @@ async def ping_database() -> None:
         await connection.execute(text("SELECT 1"))
 
 
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    """Return the process-wide session factory, building it on first use."""
+    global _sessionmaker
+    if _sessionmaker is None:
+        # expire_on_commit=False: after a commit, the caller can still read the
+        # attributes of the object it just saved without a second round trip.
+        # With the default, every attribute access after commit re-queries, and
+        # in async code that raises MissingGreenlet instead of being merely slow.
+        _sessionmaker = async_sessionmaker(
+            bind=get_engine(), expire_on_commit=False, autoflush=False
+        )
+    return _sessionmaker
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency: one session per request, always closed."""
+    async with get_sessionmaker()() as session:
+        yield session
+
+
 async def dispose_engine() -> None:
     """Close the connection pool. Called on app shutdown."""
-    global _engine
+    global _engine, _sessionmaker
+    _sessionmaker = None
     if _engine is not None:
         await _engine.dispose()
         _engine = None

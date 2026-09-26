@@ -13,6 +13,7 @@ dependencies = [
     "asyncpg>=0.30",
     "redis>=5.2",
     "arq>=0.26",
+    "alembic>=1.14",
 ]
 
 [dependency-groups]
@@ -33,6 +34,7 @@ packages = ["app"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
@@ -41,3 +43,6 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "db: needs a real PostgreSQL; skipped when TEST_DATABASE_URL is unreachable",
+]
