@@ -2,6 +2,7 @@
 and make tenant_id impossible to forget."""
 
 import datetime as dt
+import traceback
 import uuid
 
 import pytest
@@ -87,11 +88,19 @@ async def test_a_duplicate_identity_error_never_carries_the_phone_number(db_sess
     with pytest.raises(IntegrityError) as raised:
         await db_session.flush()
 
-    assert f.phone(7) in str(raised.value)  # the raw error does leak it
-    translated = as_duplicate(raised.value)
+    # Where the leak actually is, now that both engines set hide_parameters=True:
+    # that setting removes the `[parameters: ...]` appendix, but PostgreSQL's
+    # DETAIL line quotes the conflicting key and travels on the chained asyncpg
+    # exception. A formatted traceback is what logger.exception() prints, chain
+    # included, so that is the thing that must not reach a log or a tracker.
+    raw_error = raised.value
+    assert f.phone(7) in "".join(traceback.format_exception(raw_error))
+
+    translated = as_duplicate(raw_error)
     assert isinstance(translated, DuplicateRecordError)
     assert f.phone(7) not in str(translated)
     assert f.phone(7) not in repr(translated)
+    assert f.phone(7) not in "".join(traceback.format_exception(translated))
     # Proves the driver exception was actually reached: a failed unwrap would
     # fall back to "unknown constraint" and this assertion would catch it.
     assert translated.constraint == "uq_contact_identities_identity"

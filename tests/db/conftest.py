@@ -91,7 +91,10 @@ async def db_engine(migrated_database: str) -> AsyncIterator:
     "function"; a session-scoped async fixture would bind an engine to a loop
     that closes after the first test. Creating an engine is cheap.
     """
-    engine = create_async_engine(migrated_database)
+    # hide_parameters=True to match the app engine: the harness must not be more
+    # revealing than production, or a failing assertion prints row contents into
+    # CI output (hard rule 8).
+    engine = create_async_engine(migrated_database, hide_parameters=True)
     try:
         yield engine
     finally:
