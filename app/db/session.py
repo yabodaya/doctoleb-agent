@@ -31,7 +31,16 @@ def get_engine() -> AsyncEngine:
         # pool_pre_ping discards connections the database closed while idle,
         # which is what makes readiness report the truth rather than a stale
         # pooled socket.
-        _engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+        #
+        # hide_parameters=True is hard rule 8 applied to every statement at once.
+        # Without it SQLAlchemy appends the bound parameters to every DBAPI error
+        # message as `[parameters: ...]`, and in this repo those are message text,
+        # raw Meta payloads and phone numbers. One logger.exception() on any query
+        # would then leak patient content, including from code no slice has
+        # written yet.
+        _engine = create_async_engine(
+            get_settings().database_url, pool_pre_ping=True, hide_parameters=True
+        )
     return _engine
 
 
