@@ -72,6 +72,10 @@ docs/
 - After finishing, explain what was built function by function: what each does, why it exists,
   and which hard rule it protects. The developer is learning; clarity matters more than brevity here.
 - If requirements are ambiguous, ask. Do not guess.
+- Claude Code's shell is bash (Git Bash on Windows). Never use PowerShell syntax
+  such as @'...'@ in commands. For multi-line commit messages use
+  `git commit -F <file>` or several -m flags; write larger files with the
+  file-writing tool, not heredocs.
 
 ## Commands
 - `docker compose up --build`: run everything
