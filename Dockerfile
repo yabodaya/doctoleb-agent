@@ -22,6 +22,8 @@ RUN uv sync --frozen --no-install-project
 # Then the source, which changes constantly.
 COPY app ./app
 COPY tests ./tests
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN uv sync --frozen
 
 EXPOSE 8000
