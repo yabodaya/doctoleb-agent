@@ -16,7 +16,7 @@ from app.db.enums import (
     MessageModality,
     MessageStatus,
 )
-from app.db.models import ContactIdentity, Conversation
+from app.db.models import Contact, ContactIdentity, Conversation
 from app.db.repositories import (
     ContactRepository,
     ConversationRepository,
@@ -322,3 +322,35 @@ async def test_a_dead_letter_job_may_have_no_tenant(db_session):
         tenant_id=uuid.uuid4(),
     )
     assert with_tenant.tenant_id is not None
+
+
+async def test_get_or_create_by_identity_yields_to_the_winner_of_a_race(db_session, monkeypatch):
+    # The lost-race branch: the identity already exists, but this call's first
+    # get_by_identity misses it — which is exactly what a concurrent writer that
+    # committed a moment later looks like. The ON CONFLICT DO NOTHING insert then
+    # returns no row, and the repository must abandon the contact it just made and
+    # return the winner's. Otherwise one patient becomes two contacts, and every
+    # later conversation lookup picks whichever one it happens to find.
+    contacts = ContactRepository(db_session, f.TENANT_A)
+    original = await contacts.get_or_create_by_identity(Channel.WHATSAPP, f.phone(1))
+
+    real_get_by_identity = ContactRepository.get_by_identity
+    calls = {"n": 0}
+
+    async def miss_once(self, channel, external_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_get_by_identity(self, channel, external_id)
+
+    monkeypatch.setattr(ContactRepository, "get_by_identity", miss_once)
+
+    loser = ContactRepository(db_session, f.TENANT_A)
+    returned = await loser.get_or_create_by_identity(Channel.WHATSAPP, f.phone(1))
+
+    assert calls["n"] == 2  # missed, then re-read after the conflict
+    assert returned.id == original.id
+    surviving = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Contact).where(Contact.tenant_id == f.TENANT_A)
+    )
+    assert surviving == 1
