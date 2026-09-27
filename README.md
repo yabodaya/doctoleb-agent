@@ -60,3 +60,85 @@ uv run pytest -m "not db"             # skip them explicitly
 
 Set `TEST_DATABASE_URL` to point somewhere else; otherwise it is derived from
 `DATABASE_URL`.
+
+## WhatsApp webhook
+
+- `GET /webhooks/whatsapp` — Meta's one-time subscription handshake. Answers
+  `hub.challenge` as plain text when `hub.mode=subscribe` and `hub.verify_token`
+  matches `META_VERIFY_TOKEN`; `403` otherwise.
+- `POST /webhooks/whatsapp` — every delivery. Verifies `X-Hub-Signature-256`
+  against the raw body using `META_APP_SECRET`, splits the envelope into one
+  event per message and per status, stores them in `webhook_inbox`, returns
+  `200`. Nothing else happens in the request.
+
+Both secrets are empty by default, and empty means **reject**: the app starts
+without a Meta app so the rest of the repo is workable, but the webhook trusts
+nothing until `.env` is filled in. The startup log says which one is missing.
+
+Status codes: `401` invalid or missing signature, `400` valid signature but the
+body is not JSON, `200` stored (or already stored — a duplicate is a success),
+`503` storage failed, so Meta retries and the unique `provider_event_id` makes
+the retry safe.
+
+### Testing it locally, without Meta
+
+```powershell
+$env:META_APP_SECRET = "whatever-you-put-in-.env"
+uv run python scripts/sign_webhook.py "local smoke test"
+```
+
+Unsigned requests are the other half of the check — this must answer `401`:
+
+```powershell
+curl.exe -X POST http://localhost:8000/webhooks/whatsapp -H "Content-Type: application/json" -d "{}"
+```
+
+> On Windows, use `curl.exe`, not `curl`. In PowerShell `curl` is an alias for
+> `Invoke-WebRequest`, which takes different flags: `-d` and `-H` are silently
+> misread and you end up debugging a request you never sent.
+
+Check what landed, ids only — `payload` holds the message text (hard rule 8):
+
+```powershell
+docker compose exec postgres psql -U doctoleb -d doctoleb -c "select provider_event_id, status, tenant_id, created_at from webhook_inbox order by created_at desc limit 5;"
+```
+
+### A public URL for Meta (Windows)
+
+Meta must reach your machine over HTTPS, and `docker compose` publishes the API
+on `127.0.0.1:8000` only. A tunnel bridges the two.
+
+**Recommended: cloudflared.** No account, no signup, no request cap, and no
+browser interstitial.
+
+```powershell
+winget install --id Cloudflare.cloudflared
+cloudflared tunnel --url http://localhost:8000
+```
+
+It prints a `https://<random-words>.trycloudflare.com` URL. That plus
+`/webhooks/whatsapp` is the Callback URL for the Meta dashboard.
+
+**The catch, and when to prefer ngrok:** a quick tunnel's URL changes every time
+you restart it, and each change means re-verifying the callback URL in the Meta
+dashboard. ngrok's free tier includes one reserved domain that survives restarts
+— worth the signup and the authtoken if you restart often:
+
+```powershell
+winget install --id ngrok.ngrok
+ngrok config add-authtoken <token>
+ngrok http --url=<your-reserved-domain>.ngrok-free.app 8000
+```
+
+**What the tunnel exposes.** Everything the app serves, to anyone who learns the
+URL. Two mitigations are in place: the webhook itself is signature-verified, and
+the app serves no `/docs`, `/redoc` or `/openapi.json` unless `DOCS_ENABLED=true`.
+
+`DOCS_ENABLED` is off by default and is **not** tied to `APP_ENV` — the tunnel
+runs while `APP_ENV=development`, so tying the docs to `APP_ENV` would publish
+them at exactly the wrong moment. Set `DOCS_ENABLED=true` in `.env` when you want
+Swagger UI locally, and do not run a tunnel while it is on.
+
+`/health` and `/health/ready` stay reachable; they report dependency status and no
+credentials. Treat the tunnel URL as private, and stop the tunnel when you are not
+testing.
