@@ -63,6 +63,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.warning("META_APP_SECRET is not set: every WhatsApp webhook POST will be rejected")
     if not settings.meta_verify_token:
         logger.warning("META_VERIFY_TOKEN is not set: the Meta handshake will be rejected")
+    if not settings.meta_access_token:
+        # VS-004: receiving a message needs only the app secret, but REPLYING
+        # needs a token. Without this line, every reply dead-letters with a
+        # permanent 401 and the cause is three tables away.
+        logger.warning("META_ACCESS_TOKEN is not set: every WhatsApp reply will fail")
+    if not settings.whatsapp_tenant_map and not (
+        settings.dev_tenant_id and settings.meta_phone_number_id
+    ):
+        # Hard rule 4: there is no default tenant, so an unmapped number is a
+        # permanent failure per event. Names only, never values.
+        logger.warning(
+            "no tenant mapping configured: set WHATSAPP_TENANT_MAP, "
+            "or DEV_TENANT_ID with META_PHONE_NUMBER_ID"
+        )
 
     return app
 

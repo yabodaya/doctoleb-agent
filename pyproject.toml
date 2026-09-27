@@ -11,6 +11,10 @@ dependencies = [
     "pydantic-settings>=2.6",
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",
+    # Runtime, not dev: app/channels/whatsapp/client.py calls the Meta Cloud API
+    # from the api image and the worker image. It was dev-only while the test
+    # client was the only user.
+    "httpx>=0.27",
     "redis>=5.2",
     "arq>=0.26",
     "alembic>=1.14",
@@ -20,7 +24,6 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "httpx>=0.27",
     "ruff>=0.7",
 ]
 

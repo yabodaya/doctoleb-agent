@@ -346,9 +346,9 @@ Everything else stands on these. No behaviour yet.
 - Test: `tests/test_config.py` (+8)
 
 **Interfaces:**
-- Produces on `Settings`: `meta_access_token: str = ""`, `meta_phone_number_id: str = ""`, `meta_api_version: str = "v21.0"`, `meta_api_base_url: str = "https://graph.facebook.com"`, `meta_send_timeout_seconds: float = 10.0`, `whatsapp_tenant_map: str = ""`, `dev_tenant_id: str = ""`, `whatsapp_reply_to_types: str = "text"`, `job_max_tries: int = 5`, `job_backoff_base_seconds: float = 5.0`, `job_backoff_max_seconds: float = 300.0`, `job_timeout_seconds: float = 60.0`, `job_lease_margin_seconds: float = 30.0`, and a derived `claim_lease_seconds` property.
+- Produces on `Settings`: `meta_access_token: str = ""`, `meta_phone_number_id: str = ""`, `meta_api_version: str = "v21.0"`, `meta_api_base_url: str = "https://graph.facebook.com"`, `meta_send_timeout_seconds: float = 10.0`, `whatsapp_tenant_map: str = ""`, `dev_tenant_id: str = ""`, `whatsapp_reply_to_types: str = "text"`, `job_max_tries: int = 5`, `job_backoff_base_seconds: float = 5.0`, `job_backoff_max_seconds: float = 300.0`, `job_timeout_seconds: float = 60.0`, `job_lease_margin_seconds: float = 30.0`, derived `claim_lease_seconds` and `reply_to_types` properties, and a `_blank_means_unset` validator for the two settings that have real defaults.
 
-**Expected tests after this task: 141.**
+**Expected tests after this task: 141** (actual: 142 — one extra test, see Step 2's blank-version entry)**.**
 
 - [ ] **Step 1: Confirm the baseline**
 
@@ -363,6 +363,7 @@ Write the number down. Every later "expected tests" line is relative to it.
 In `tests/test_config.py`:
 
 - `test_the_meta_send_settings_default_to_empty_or_safe_values` — `meta_access_token == ""`, `meta_phone_number_id == ""`, a non-empty `meta_api_version`, and a `meta_api_base_url` on `graph.facebook.com`. Empty credentials by default, VS-003's A3: the app must boot without a Meta app.
+- `test_a_blank_meta_api_version_falls_back_to_the_default` — **not in the plan's first draft, and needed.** `.env.example` ships `META_API_VERSION=` with no value, so a `.env` copied from it sets the variable to the empty string, which pydantic accepts as a perfectly good `str`. The send URL would then be built with a missing path segment and every reply would 404 in a way that looks like a bug in the client. A `mode="before"` validator on `meta_api_version` and `meta_api_base_url` treats a blank string as "unset" and restores the field default. Deliberately **not** applied to the credentials: an empty `META_ACCESS_TOKEN` must stay empty, because "not configured" has to mean "every send fails visibly", never "fall back to something".
 - `test_the_tenant_map_is_a_plain_string_and_defaults_to_empty` — asserts the *type* is `str`, with a comment naming A1: a `dict` field would make `WHATSAPP_TENANT_MAP=` in `.env.example` raise at import.
 - `test_an_empty_tenant_map_does_not_stop_the_app_from_starting` — `Settings(_env_file=None, …, whatsapp_tenant_map="")` builds.
 - `test_a_malformed_tenant_map_does_not_stop_the_app_from_starting` — `whatsapp_tenant_map="{not json"` builds; the failure belongs to the resolver, not to boot.
