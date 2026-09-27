@@ -1564,10 +1564,11 @@ The acceptance criteria that span components, then the documentation `CLAUDE.md`
 **Files:**
 - Create: `tests/worker/test_end_to_end.py` (7 new)
 - Modify: `tests/api/test_route_exposure.py` (+1: the route inventory is unchanged by this slice)
-- Modify: `README.md` (running the worker, watching a job, reading a dead letter)
+- Modify: `README.md` (running the worker, watching a job, reading a dead letter, and a table of what each outcome code means when a reply does not arrive)
+- Modify: `Dockerfile` (copy `.env.example` in — see the note below)
 - Modify: `docs/slices/VS-004.md` (Status, Notes, Follow-ups), `docs/slices/README.md`
 
-**Expected tests after this task: 263.**
+**Expected tests after this task: 263** (actual: 305 on the host and in the container; 157 passed / 148 skipped with nothing running)**.**
 
 - [ ] **Step 1: Write the end-to-end tests**
 
@@ -1580,6 +1581,8 @@ Webhook in, reply out, with a mocked Meta and a real database:
 - `test_a_status_delivered_before_the_reply_job_ran_retries_then_succeeds` — the ordering acceptance case, in the order Meta can actually produce.
 - `test_a_meta_outage_retries_and_then_dead_letters_without_replying` — 500 on every attempt through `job_max_tries`: one `dead_letter_jobs` row, zero outbound messages with a wamid, and the patient told nothing untrue (hard rule 5's shape). Also asserts no lease is left behind, so the row is not stuck.
 - `test_nothing_in_redis_or_the_logs_from_a_full_run_contains_a_wamid` — **C2, once over the whole path.** Drive a delivery end to end with `caplog` at `DEBUG` and a recording queue, then assert that no captured log line, no job id and no job argument contains any `wamid()` value from the payload. One test that fails if any future log line in this slice reaches for the obvious identifier.
+
+**One Dockerfile change, found here.** `test_every_new_key_is_present_in_env_example` fails inside the container with `FileNotFoundError`: the image copies `app`, `tests`, `alembic.ini` and `migrations`, but not `.env.example`. Skipping when the file is absent would make the acceptance run the one place that does *not* check the slice's own configuration documentation, so the Dockerfile copies it in. It holds key names and no values, and `.dockerignore` already excludes the real `.env` while whitelisting the example.
 
 - [ ] **Step 2: Run the full suite both ways**
 

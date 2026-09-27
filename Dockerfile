@@ -24,6 +24,11 @@ COPY app ./app
 COPY tests ./tests
 COPY alembic.ini ./
 COPY migrations ./migrations
+# The EXAMPLE, never .env — it holds key names and no values, and .dockerignore
+# keeps the real one out. Copied in because tests/test_config.py asserts that
+# every setting the code reads is documented there, and that assertion has to
+# hold in the container the acceptance run happens in.
+COPY .env.example ./
 RUN uv sync --frozen
 
 EXPOSE 8000
