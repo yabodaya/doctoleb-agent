@@ -862,10 +862,10 @@ Hard rule 4, in one small module with one parse site, so that the type question 
 - `TenantId = uuid.UUID`
 - `class UnknownPhoneNumberError(Exception)` — carries the `phone_number_id` only
 - `class TenantMapError(Exception)` — the configured map could not be read
-- `class TenantResolver(Protocol): def resolve(self, phone_number_id: str) -> TenantId: ...`
+- `@runtime_checkable class TenantResolver(Protocol): def resolve(self, phone_number_id: str) -> TenantId: ...`
 - `class ConfigTenantResolver` with `__init__(mapping: Mapping[str, TenantId])`, `from_settings(settings) -> ConfigTenantResolver`, and `resolve()`
 
-**Expected tests after this task: 171.**
+**Expected tests after this task: 171** (actual: 182 — four more resolver tests than listed, and Task 2's overshoot carried forward)**.**
 
 - [ ] **Step 1: Write the failing resolver tests**
 
@@ -879,6 +879,10 @@ Hard rule 4, in one small module with one parse site, so that the type question 
 - `test_an_explicit_map_wins_over_the_dev_fallback`
 - `test_no_map_and_no_fallback_resolves_nothing` — an empty resolver, and every event dead-letters. Not a crash (A1).
 - `test_the_resolver_never_logs_a_tenant_map_value` — `caplog`: the startup line names the entry count and the config source, never a uuid or a number.
+- `test_a_map_that_is_not_an_object_raises` — valid JSON of the wrong shape (`["a","b"]`) is a different failure from invalid JSON, and `.items()` on a list would be an `AttributeError` escaping as a crash rather than a `TenantMapError`.
+- `test_a_dev_tenant_id_without_a_phone_number_id_resolves_nothing` — half the A2 fallback is not the fallback; guessing which number the lone tenant belongs to is the same mistake as a default tenant.
+- `test_a_broken_map_does_not_name_the_offending_value` — the error carries `bad_tenant_map` and nothing else.
+- `test_the_config_resolver_satisfies_the_protocol` — `runtime_checkable`, so a worker-test fake and the real resolver cannot drift.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
