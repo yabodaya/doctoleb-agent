@@ -8,13 +8,17 @@ that carries the statement's parameters.
 
 import logging
 
+import pytest
+
 from tests.whatsapp_factories import (
     PATIENT_TEXT,
     PROFILE_NAME,
     envelope,
     phone,
     signed,
+    status_update,
     text_message,
+    wamid,
 )
 
 PATH = "/webhooks/whatsapp"
@@ -51,3 +55,23 @@ async def test_an_unparseable_body_logs_no_body(client, configure, no_database, 
     assert response.status_code == 400
     assert_no_patient_content(caplog)
     assert PATIENT_TEXT not in response.text
+
+
+@pytest.mark.db
+async def test_a_stored_webhook_logs_event_ids_and_never_content(
+    client, configure, use_database, caplog
+):
+    """Hard rule 8 on the path that actually carries a patient's words.
+
+    Logging the ids is the point - without them a production incident has nothing
+    to correlate. Logging the body is the violation.
+    """
+    raw, headers = signed(envelope(messages=[text_message(1)], statuses=[status_update(2, "read")]))
+
+    with caplog.at_level(logging.INFO):
+        response = await client.post(PATH, content=raw, headers=headers)
+
+    assert response.status_code == 200
+    assert f"msg:{wamid(1)}" in caplog.text
+    assert f"status:{wamid(2)}:read" in caplog.text
+    assert_no_patient_content(caplog)
