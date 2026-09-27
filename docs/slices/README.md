@@ -5,7 +5,7 @@ Work in order. Set exactly one slice to IN PROGRESS at a time.
 |---|---|---|
 | VS-001 | Project skeleton | DONE |
 | VS-002 | Messaging database | DONE |
-| VS-003 | Receive WhatsApp webhook | TODO |
+| VS-003 | Receive WhatsApp webhook | IN PROGRESS |
 | VS-004 | Worker + send reply | TODO |
 | VS-005 | AI replies | TODO |
 | VS-006 | Agent Core + first tool | TODO |
