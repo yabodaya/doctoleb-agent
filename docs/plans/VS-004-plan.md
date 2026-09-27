@@ -1208,7 +1208,7 @@ The machinery, with both handlers stubbed. Doing it before the handlers means re
 - `def dead_letter_payload(row_id, kind, phone_number_id, job_try) -> dict[str, Any]`
 - `WorkerSettings.functions` gains `func(process_inbox_event, max_tries=…, timeout=…)`
 
-**Expected tests after this task: 221.**
+**Expected tests after this task: 221** (actual: 257)**.**
 
 - [ ] **Step 1: Write the failing backoff tests**
 
@@ -1231,6 +1231,11 @@ The machinery, with both handlers stubbed. Doing it before the handlers means re
 - `test_a_retryable_failure_releases_the_lease` — otherwise the deferred retry would arrive to find its own stale lease and defer again, turning one backoff curve into `max_tries` lease timeouts (A17).
 - `test_a_successful_job_leaves_no_lease_behind`
 - `test_the_last_try_dead_letters_instead_of_retrying` — `job_try == job_max_tries`: one `dead_letter_jobs` row, `attempts` matching, no `Retry` raised, and no lease left behind.
+- `test_a_retryable_failure_still_leaves_attempts_incremented` — **amendment A1's own test.** Folded into the job's transaction, the claim (and `attempts + 1` with it) is undone by every retryable failure, so a job that failed five times reports one attempt and the retry curve is invisible to whoever is triaging.
+- `test_a_payload_with_no_phone_number_id_dead_letters` and `test_an_unmapped_phone_number_id_dead_letters` — the two permanent tenant failures, separately, because they have different causes and different fixes.
+- `test_the_dead_letter_has_no_tenant_when_resolution_is_what_failed` — VS-002 made `dead_letter_jobs.tenant_id` nullable for exactly this, and nothing had exercised it.
+- `test_a_permanent_failure_releases_the_lease_and_marks_the_row_failed`
+- `test_the_worker_package_never_splits_a_provider_event_id` — source-level, with comments and string literals stripped by `tokenize`. A plain substring scan finds the docstring that *explains* the rule and fails the file for being documented.
 - `test_a_dead_letter_payload_carries_no_patient_content` — the payload keys are exactly `{"inbox_row_id", "kind", "phone_number_id", "job_try"}`, and neither `PATIENT_TEXT`, `PROFILE_NAME`, `phone()` **nor `wamid()`** appears anywhere in the serialised row. **C7 and C2.**
 - `test_no_log_line_from_the_envelope_contains_a_wamid` — every line uses `event_id=<row uuid>` (C2), including the retry and dead-letter lines that a real outage would repeat five times.
 - `test_a_dead_lettered_event_leaves_the_inbox_row_failed_with_a_reason_code` — `last_error` is a short code, never an exception message.

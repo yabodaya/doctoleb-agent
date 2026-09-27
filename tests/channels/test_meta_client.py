@@ -254,17 +254,29 @@ def test_the_worker_package_contains_no_http_status_literals():
     Asserted against the source, because the failure mode is a second opinion
     creeping in - `if response.status_code == 429` in a handler - which no
     behavioural test would catch until the two disagreed.
+
+    Comments and string literals are stripped with tokenize before the check. A
+    line-based scan flags the docstrings that EXPLAIN the 429 policy, which would
+    make this test punish the code for being documented.
     """
+    import io
     import pathlib
     import re
+    import token as token_module
+    import tokenize
 
     worker = pathlib.Path("app/worker")
-    if not worker.exists():  # the package arrives in Task 6
+    if not worker.exists():  # pragma: no cover - the package exists from VS-001
         pytest.skip("app/worker/ does not exist yet")
 
     offenders = []
     for path in worker.rglob("*.py"):
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if re.search(r"\bstatus_code\b|\b(4\d\d|5\d\d)\b", line) and "#" not in line:
-                offenders.append(f"{path}:{number}")
+        source = path.read_text(encoding="utf-8")
+        code = " ".join(
+            tok.string
+            for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type not in (token_module.COMMENT, token_module.STRING)
+        )
+        if re.search(r"\bstatus_code\b|\b(4\d\d|5\d\d)\b", code):
+            offenders.append(str(path))
     assert offenders == []
