@@ -56,3 +56,48 @@ async def test_health_still_answers_with_the_docs_off(client_for):
     # healthcheck and the developer both check the process is alive.
     async with client_for(_app()) as client:
         assert (await client.get("/health")).status_code == 200
+
+
+def _paths_and_methods(app: FastAPI) -> dict[str, set[str]]:
+    """Every path this app actually serves, flattened.
+
+    FastAPI 0.141 keeps an included router as a wrapper object on `app.routes`
+    rather than flattening its APIRoutes onto it, so a plain comprehension over
+    `app.routes` sees no paths at all and would pass by finding nothing. This
+    walks whatever is there: real routes, plus any wrapper carrying a router of
+    its own. Deliberately not `app.openapi()["paths"]`, which would miss a route
+    marked include_in_schema=False - exactly the kind this test exists to catch.
+    """
+    found: dict[str, set[str]] = {}
+
+    def walk(routes) -> None:
+        for route in routes:
+            inner = getattr(route, "original_router", None) or getattr(route, "router", None)
+            if inner is not None:
+                walk(inner.routes)
+                continue
+            path = getattr(route, "path", None)
+            if path:
+                found.setdefault(path, set()).update(getattr(route, "methods", None) or set())
+
+    walk(app.routes)
+    return found
+
+
+def test_the_app_exposes_only_the_expected_paths():
+    """Review Focus 9.
+
+    An inventory, not a spot check: the tunnel makes every route public, so a
+    future slice adding an unauthenticated endpoint should fail here rather than
+    be discovered from the outside.
+    """
+    served = _paths_and_methods(_app())
+
+    assert set(served) == {"/health", "/health/ready", "/webhooks/whatsapp"}
+
+
+def test_the_webhook_answers_both_methods_meta_uses():
+    served = _paths_and_methods(_app())
+
+    # GET is the one-time handshake, POST is every delivery. Nothing else.
+    assert served["/webhooks/whatsapp"] == {"GET", "POST"}

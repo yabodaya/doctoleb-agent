@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
+from app.api.whatsapp import router as whatsapp_router
 from app.config import Settings, get_settings
 from app.db.session import dispose_engine
 from app.logging_config import configure_logging
@@ -53,6 +54,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.include_router(health_router)
+    app.include_router(whatsapp_router)
 
     if not settings.meta_app_secret:
         # Names only, never values (hard rule 9). Without this line, "every
