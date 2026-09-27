@@ -11,6 +11,7 @@ from app.api.whatsapp import router as whatsapp_router
 from app.config import Settings, get_settings
 from app.db.session import dispose_engine
 from app.logging_config import configure_logging
+from app.queue.arq_queue import close_job_queue
 from app.queue.redis import close_redis
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     await dispose_engine()
     await close_redis()
+    await close_job_queue()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

@@ -11,12 +11,15 @@ import pytest
 
 from app.config import Settings, get_settings
 from app.db.session import get_session
+from app.queue import get_job_queue
 from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
     db_engine,
     db_session,
     migrated_database,
+    second_session_factory,
     test_database_url,
 )
+from tests.queue.fakes import FakeJobQueue
 from tests.whatsapp_factories import APP_SECRET, VERIFY_TOKEN
 
 
@@ -91,3 +94,26 @@ def use_database(app, db_session):  # noqa: F811  (db_session is the re-exported
 
     app.dependency_overrides[get_session] = override
     return db_session
+
+
+@pytest.fixture(autouse=True)
+def queue(app):
+    """Every endpoint test gets a recording queue, not a real Redis connection.
+
+    Autouse, because from VS-004 on the webhook enqueues on every successful
+    POST. Without this every existing endpoint test would open a Redis pool, and
+    VS-001's rule that `pytest` passes with nothing running would quietly die.
+
+    Returns the fake, so a test can assert on what was enqueued.
+    """
+    fake = FakeJobQueue()
+    app.dependency_overrides[get_job_queue] = lambda: fake
+    return fake
+
+
+@pytest.fixture
+def failing_queue(app, queue):
+    """Swap in a queue that raises, for the enqueue-failure path."""
+    fake = FakeJobQueue(fail=True)
+    app.dependency_overrides[get_job_queue] = lambda: fake
+    return fake

@@ -1048,7 +1048,7 @@ The URL is `f"{base_url}/{api_version}/{phone_number_id}/messages"`. Every log l
 - `class ArqJobQueue(JobQueue)`, `async def get_job_queue() -> JobQueue` (the FastAPI dependency), `async def close_job_queue() -> None`
 - `class FakeJobQueue(JobQueue)` in `tests/queue/fakes.py` — records row ids, or raises on demand
 
-**Expected tests after this task: 204.**
+**Expected tests after this task: 204** (actual: 234)**.**
 
 - [ ] **Step 1: Write the failing queue tests**
 
@@ -1072,7 +1072,7 @@ The URL is `f"{base_url}/{api_version}/{phone_number_id}/messages"`. Every log l
 - `test_nothing_is_enqueued_when_there_is_nothing_to_store` — an unmodelled payload still answers 200 and touches neither the database nor the queue.
 - `test_an_enqueue_failure_answers_503_and_does_not_lose_the_rows` — the rows stay committed (they are, and the redelivery will re-enqueue), and 503 is retryable so Meta comes back. **C1.**
 - `test_the_enqueue_failure_log_carries_row_ids_and_no_wamid` — **C2**: the failure line names row UUIDs, not the `provider_event_id` values the request just stored.
-- `test_the_enqueue_happens_after_the_commit` — a fake queue whose `enqueue_inbox_event` reads the row through an independent session and asserts it is visible. A job that starts before the commit finds nothing and dead-letters a message that was never lost.
+- `test_the_enqueue_happens_after_the_commit` — asserted as an **ordering**, by spying on the session's `commit`, not by reading the row from a second connection. The plan's first draft said to do the latter, and it cannot work: `use_database` wraps the test in one transaction that is rolled back, with `join_transaction_mode="create_savepoint"`, so the endpoint's commit releases a savepoint and is *by design* invisible to any other connection. A visibility check there fails against correct code.
 - `test_no_log_line_from_the_enqueue_path_contains_patient_content` — `caplog`, against `PATIENT_TEXT`, `phone()` **and `wamid()`**.
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -1143,7 +1143,7 @@ Add `queue: Annotated[JobQueue, Depends(get_job_queue)]` to `receive()`. The sto
         await session.commit()
 ```
 
-The existing log line keeps its counts but reports `new=` from `len(row_ids)`-minus-duplicates as before; **it no longer builds a comma-joined list of `provider_event_id` values** — those are wamids (C2). It logs row ids instead.
+The existing "stored" log line **keeps printing `provider_event_id` values, unchanged.** That was reconsidered during execution and left alone deliberately: `tests/api/test_webhook_logging.py::test_a_stored_webhook_logs_event_ids_and_never_content` asserts those wamids are present, so narrowing the line means changing a merged slice's tested log contract — which is exactly what C2a says is *not* this slice's work. `new=` is now counted explicitly rather than derived from the id list. Every line VS-004 *adds* uses the row id, so the slice adds nothing to the problem, and the line carries a comment saying so.
 
 Then, at the seam:
 

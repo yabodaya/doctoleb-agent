@@ -1,18 +1,28 @@
 """The WhatsApp webhook.
 
 Hard rule 1: this endpoint verifies, deduplicates, stores and returns 200. That
-is all. No OpenAI call, no Meta call, no media download, no tenant resolution,
-no reply - and no enqueue yet: VS-004 adds it at the seam marked in receive().
+is all. No OpenAI call, no Meta call, no media download, no tenant resolution
+and no reply. The one thing it hands off is an enqueue of row ids, after the
+commit, which is a single Redis write.
 
-Hard rule 8: every log line here carries identifiers and counts. A wamid is an
-opaque Meta identifier, not patient content; a message body, a profile name and
-a phone number are, and none of them may appear in a log, an exception, or a
+Hard rule 8: every log line here carries identifiers and counts. A message body,
+a profile name and a phone number never appear in a log, an exception, or a
 response body.
+
+VS-003 also reasoned that a wamid is "an opaque Meta identifier, not patient
+content", and its happy-path line prints provider_event_id values on that basis.
+VS-004 found that reasoning to be wrong (plan note C2): a wamid is base64 and
+commonly decodes to include the patient's phone number, and a status event id
+carries the wamid of the message we sent TO the patient. Every line VS-004 adds
+therefore identifies an event by our own webhook_inbox row id. VS-003's line is
+left alone (note C2a) because it is a merged slice's tested log contract, and
+narrowing it is its own change - it is a Follow-up on VS-004, not a task in it.
 """
 
 import hmac
 import json
 import logging
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -24,6 +34,7 @@ from app.channels.whatsapp.signature import SIGNATURE_HEADER, verify_signature
 from app.config import Settings, get_settings
 from app.db.repositories import WebhookInboxRepository
 from app.db.session import get_session
+from app.queue import EnqueueError, JobQueue, get_job_queue
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +92,7 @@ async def receive(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    queue: Annotated[JobQueue, Depends(get_job_queue)],
     signature: Annotated[str | None, Header(alias=SIGNATURE_HEADER)] = None,
 ) -> dict[str, str]:
     """Verify, split, store, 200.
@@ -117,7 +129,8 @@ async def receive(
         return {"status": "ok"}
 
     inbox = WebhookInboxRepository(session)
-    new_event_ids: list[str] = []
+    row_ids: list[uuid.UUID] = []
+    new_count = 0
     try:
         for item in items:
             # store_if_new is INSERT ... ON CONFLICT DO NOTHING (hard rule 2):
@@ -125,7 +138,21 @@ async def receive(
             # no SELECT-then-INSERT window and no IntegrityError to catch.
             row = await inbox.store_if_new(item.provider_event_id, item.payload)
             if row is not None:
-                new_event_ids.append(item.provider_event_id)
+                row_ids.append(row.id)
+                new_count += 1
+                continue
+            # Already stored - a Meta redelivery. We still need this row's id,
+            # because it is still going to be enqueued (see the seam below), and
+            # store_if_new returns None on conflict. One SELECT on the unique
+            # index, on the duplicate path only.
+            #
+            # NOT a freshly generated id: the whole point of enqueueing by row id
+            # is that the id is stable across redeliveries, which is what lets
+            # arq's job id suppress the repeat and the worker's lease serialise
+            # two of them.
+            existing = await inbox.get_by_event_id(item.provider_event_id)
+            if existing is not None:
+                row_ids.append(existing.id)
         # One commit for the whole delivery: either every event in this request
         # is durable, or none is.
         await session.commit()
@@ -166,17 +193,51 @@ async def receive(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="storage unavailable"
         ) from None
 
+    # VS-003's line, left as VS-003 wrote it, on purpose. It prints
+    # provider_event_id values - wamids - which plan note C2a says are patient
+    # content and C2a says are NOT this slice's to change: it is a merged slice's
+    # tested log contract (tests/api/test_webhook_logging.py asserts the wamids
+    # are present), and narrowing it is its own piece of work. Every line VS-004
+    # writes below uses the row id instead, so this slice adds nothing to the
+    # problem. Recorded as a Follow-up on VS-004.
     logger.info(
         "whatsapp webhook stored events=%d new=%d ids=%s",
         len(items),
-        len(new_event_ids),
-        ",".join(new_event_ids),
+        new_count,
+        ",".join(item.provider_event_id for item in items),
     )
 
-    # --- VS-004 seam -------------------------------------------------------
-    # VS-004 enqueues one job per id in `new_event_ids`, right here: after the
-    # commit (a job must never see a row that is not committed yet) and before
-    # the return. Nothing above this line changes, and duplicates are already
-    # filtered out - `new_event_ids` holds only rows this request created.
+    # --- enqueue (VS-004) --------------------------------------------------
+    # After the commit, always: a job that started before it would find no row.
+    #
+    # One job per EXTRACTED item, not per newly stored item. A redelivery whose
+    # row already exists is enqueued again on purpose: the reason Meta is
+    # redelivering may be that our first enqueue is exactly what failed, and
+    # "already stored" would then mean "never answered". Three things make the
+    # repeat harmless - the row id is the same one as last time, arq refuses a
+    # job id it already holds, and the worker skips an event already PROCESSED.
+    #
+    # The argument is OUR webhook_inbox row id and nothing else (hard rule 8,
+    # plan note C2). Never the provider_event_id: a wamid is base64 and decodes
+    # to include the patient's phone number, and a status event id carries the
+    # wamid of the message we sent TO the patient. Redis, the job arguments, the
+    # retry log lines and the dead letters all stay free of it.
+    try:
+        for row_id in row_ids:
+            await queue.enqueue_inbox_event(row_id)
+    except EnqueueError as error:
+        logger.error(
+            "whatsapp webhook enqueue failed error=%s event_ids=%s",
+            type(error).__name__,
+            ",".join(str(row_id) for row_id in row_ids),
+        )
+        # Not 200. The rows are committed, but nothing will ever process them,
+        # and 200 tells Meta to forget the event - the same silent loss the
+        # storage path's 503 exists to prevent, one layer further in. Meta
+        # redelivers, the rows dedupe, their ids are looked up again, and the
+        # enqueue is tried again.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="queue unavailable"
+        ) from None
     # ----------------------------------------------------------------------
     return {"status": "ok"}
