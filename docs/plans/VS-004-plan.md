@@ -933,7 +933,7 @@ One attempt, one timeout, one classifier. Requirement 4's "keep this classificat
 - `class MetaClient: __init__(http: httpx.AsyncClient, settings: Settings); async def send_text(self, phone_number_id: str, to: str, text: str) -> SendResult`
 - `app/channels/whatsapp/redact.py`: `scrub(value: str) -> str`, `error_reason(status_code: int, body: bytes | None) -> str`
 
-**Expected tests after this task: 187.**
+**Expected tests after this task: 187** (actual: 216 — the status classifications are parametrised, so each code is its own test)**.**
 
 - [ ] **Step 1: Write the failing redaction tests**
 
@@ -941,6 +941,7 @@ One attempt, one timeout, one classifier. Requirement 4's "keep this classificat
 - `test_an_error_reason_is_built_from_codes_only` — a real-shaped Meta error body (`{"error": {"message": "…+96170123456…", "type": "OAuthException", "code": 131026, "error_subcode": 123}}`) produces `http_400 code_131026 subcode_123` and nothing else.
 - `test_an_error_reason_never_contains_the_message_field` — the specific leak requirement 6 names: Meta's `error.message` can quote the recipient's number.
 - `test_an_unparseable_error_body_still_produces_a_reason` — `http_502`, no exception. A sanitiser that raises on junk is a sanitiser that gets bypassed.
+- `test_short_numbers_survive` and `test_a_seven_digit_error_subcode_survives_intact` — **the plan's first draft had this wrong.** It said to pass the assembled reason through `scrub` "as belt and braces". Meta's `error_subcode` values are seven digits (`2494010` is "recipient not in the allowed list", the most likely failure on a test number), so the digit run this module redacts would eat the single most useful code in the reason. `error_reason` therefore does **not** scrub: every part of it is built from an `int` that passed an `isinstance` check, and the module's actual job is making sure no Meta-supplied *string* ever gets that far. `scrub` stays exported and tested for the case it is genuinely for.
 
 - [ ] **Step 2: Write the failing client tests**
 
@@ -953,7 +954,10 @@ All with `httpx.MockTransport` — no network, ever.
 - `test_a_500_is_retryable`, `test_a_429_is_retryable`, `test_a_timeout_is_retryable`, `test_a_transport_error_is_retryable`
 - `test_a_400_is_permanent`, `test_a_401_is_permanent` — a bad token is not a thing retries fix.
 - `test_a_2xx_with_no_message_id_is_success_with_no_wamid` — the `sent_without_id` branch; asserts the outcome is `SUCCESS`, because retrying would duplicate the message Meta already accepted.
-- `test_no_log_line_contains_the_access_token_or_the_recipient` — `caplog` over a failing send: neither the token nor `to` appears.
+- `test_no_log_line_contains_the_access_token_the_recipient_or_the_text` — `caplog` over a failing send: neither the token, nor `to`, nor the message body appears; `phone_number_id` does, and is what makes the line useful.
+- `test_an_error_that_is_not_ours_escapes` — `classify_exception` returns `None` for a `ValueError`, so a bug in our own serialisation raises instead of being retried five times and dead-lettered as if Meta had been unreachable.
+- `test_a_2xx_with_an_unreadable_body_is_success_with_no_wamid` — the other half of `accepted_without_id`.
+- `test_the_worker_package_contains_no_http_status_literals` — Review Focus 6 asserted against the source, because a second opinion creeping into a handler (`if response.status_code == 429`) is invisible to any behavioural test until the two disagree.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -977,7 +981,7 @@ def scrub(value: str) -> str:
     """
 ```
 
-`error_reason(status_code, body)` returns `http_<status>` plus `code_<n>` and `subcode_<n>` when they are integers in `body["error"]`, each part passed through `scrub`, and never reads `error.message` at all.
+`error_reason(status_code, body)` returns `http_<status>` plus `code_<n>` and `subcode_<n>` when they are integers in `body["error"]`, and never reads `error.message` or `error.error_user_msg` at all. It does **not** apply `scrub` — see the test entry above.
 
 - [ ] **Step 5: Write `app/channels/whatsapp/client.py`**
 
