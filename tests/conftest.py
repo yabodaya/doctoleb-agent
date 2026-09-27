@@ -9,10 +9,16 @@ import os
 
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+# 127.0.0.1, not localhost. On Windows "localhost" resolves to ::1 first, and
+# nothing is listening there - compose publishes on 127.0.0.1 - so every new
+# connection pays a failed IPv6 attempt before falling back to IPv4. With one
+# engine per database test that is the difference between a ~2 minute host run
+# and a ~15 second one. Inside the container DATABASE_URL is already set from
+# .env, so this default never applies there.
 os.environ.setdefault(
-    "DATABASE_URL", "postgresql+asyncpg://doctoleb:doctoleb@localhost:5432/doctoleb"
+    "DATABASE_URL", "postgresql+asyncpg://doctoleb:doctoleb@127.0.0.1:5432/doctoleb"
 )
-os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
