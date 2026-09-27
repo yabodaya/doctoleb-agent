@@ -17,7 +17,7 @@ from app.db.enums import (
     MessageModality,
     MessageStatus,
 )
-from app.db.models import Contact, ContactIdentity, Conversation
+from app.db.models import Contact, ContactIdentity, Conversation, WebhookInbox
 from app.db.repositories import (
     ContactRepository,
     ConversationRepository,
@@ -363,3 +363,352 @@ async def test_get_or_create_by_identity_yields_to_the_winner_of_a_race(db_sessi
         sa.select(sa.func.count()).select_from(Contact).where(Contact.tenant_id == f.TENANT_A)
     )
     assert surviving == 1
+
+
+# --- the claim, and the lease that makes it safe under concurrency ----------
+
+
+LEASE = 90.0
+
+
+async def _stored_inbox(session, n: int = 1, **overrides):
+    row = f.make_inbox(n, **overrides)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def test_claiming_a_received_row_returns_it_and_marks_it_processing(db_session):
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+
+    claim = await inbox.claim(row.id, LEASE)
+
+    assert claim.state == "claimed"
+    assert claim.row is not None
+    assert claim.row.status == InboxStatus.PROCESSING.value
+
+
+async def test_claiming_increments_attempts(db_session):
+    """The attempt count is what a dead letter reports.
+
+    Incremented by the claim itself, and committed by the caller straight away
+    (plan amendment A1), so a try that dies before it can record anything still
+    counts.
+    """
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+
+    first = await inbox.claim(row.id, LEASE)
+    assert first.row.attempts == 1
+
+    await inbox.release(row.id)
+    second = await inbox.claim(row.id, LEASE)
+    assert second.row.attempts == 2
+
+
+async def test_claiming_a_processed_row_reports_already_processed(db_session):
+    """The worker-side idempotency gate (VS-004 requirement 1).
+
+    arq's job-id dedup is short-lived - results expire - so this is the check
+    that holds forever.
+    """
+    row = await _stored_inbox(db_session, status=InboxStatus.PROCESSED.value)
+    inbox = WebhookInboxRepository(db_session)
+
+    claim = await inbox.claim(row.id, LEASE)
+
+    assert claim.state == "already_processed"
+    assert claim.row is None
+
+
+async def test_claiming_a_processing_row_with_no_lease_succeeds(db_session):
+    """A crashed previous try MUST be reclaimable.
+
+    The job leaves the row PROCESSING across the Meta call on purpose, so a try
+    that died there left it PROCESSING with a lease. Once that lease is gone,
+    refusing the row would mean the patient's message is never answered - which
+    is why the guard is "status <> PROCESSED" and not "status = RECEIVED".
+    """
+    row = await _stored_inbox(db_session, status=InboxStatus.PROCESSING.value)
+    inbox = WebhookInboxRepository(db_session)
+
+    assert (await inbox.claim(row.id, LEASE)).state == "claimed"
+
+
+async def test_claiming_a_missing_row_reports_missing(db_session):
+    inbox = WebhookInboxRepository(db_session)
+
+    assert (await inbox.claim(uuid.uuid4(), LEASE)).state == "missing"
+
+
+async def test_claiming_sets_a_lease_in_the_future_measured_by_the_database(db_session):
+    """Plan assumption A16: the lease is PostgreSQL's clock, not a worker's.
+
+    Computed server-side inside the claiming UPDATE, so a worker with a skewed
+    clock cannot grant itself a longer lease and two workers never have to agree
+    on the time - only the database does. Compared against the same
+    transaction's now(), which is why it is read here rather than in Python.
+    """
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+
+    claim = await inbox.claim(row.id, LEASE)
+    now = await db_session.scalar(sa.select(sa.func.now()))
+
+    assert claim.row.locked_until > now
+    assert (claim.row.locked_until - now).total_seconds() == pytest.approx(LEASE, abs=5)
+
+
+async def test_a_row_with_a_live_lease_is_not_claimable(db_session):
+    """Plan note C3a, at the layer that fixes it.
+
+    attempts must NOT move: another worker's try is not this job's try, and a
+    dead letter's count has to be the number of times WE tried.
+    """
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+    await inbox.claim(row.id, LEASE)
+
+    second = await inbox.claim(row.id, LEASE)
+
+    assert second.state == "locked"
+    assert second.row is None
+    refreshed = await inbox.get(row.id)
+    assert refreshed.attempts == 1
+
+
+async def test_a_row_with_an_expired_lease_is_claimable(db_session):
+    """Otherwise one SIGKILL would strand a patient's message forever.
+
+    The lease is a bounded delay, not a tombstone.
+    """
+    row = await _stored_inbox(
+        db_session, status=InboxStatus.PROCESSING.value, locked_until=f.LONG_AGO
+    )
+    inbox = WebhookInboxRepository(db_session)
+
+    assert (await inbox.claim(row.id, LEASE)).state == "claimed"
+
+
+async def test_releasing_clears_the_lease_without_touching_the_status(db_session):
+    """release() runs on the retry path, where the row must stay PROCESSING.
+
+    Clearing the status as well would be indistinguishable from a fresh event,
+    and holding the lease instead would make the deferred retry find its own
+    stale lease and defer again.
+    """
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+    await inbox.claim(row.id, LEASE)
+
+    await inbox.release(row.id)
+
+    refreshed = await inbox.get(row.id)
+    assert refreshed.locked_until is None
+    assert refreshed.status == InboxStatus.PROCESSING.value
+
+
+async def test_marking_a_row_processed_also_clears_the_lease(db_session):
+    row = await _stored_inbox(db_session)
+    inbox = WebhookInboxRepository(db_session)
+    await inbox.claim(row.id, LEASE)
+
+    await inbox.mark(row.id, InboxStatus.PROCESSED)
+
+    refreshed = await inbox.get(row.id)
+    assert refreshed.status == InboxStatus.PROCESSED.value
+    assert refreshed.locked_until is None
+
+
+async def test_get_by_event_id_finds_the_row_the_webhook_could_not_insert(db_session):
+    """The webhook's duplicate path (plan note C2).
+
+    store_if_new returns None on conflict, but the redelivery is still enqueued -
+    by the SAME row id as last time, which is what lets arq's job id suppress the
+    repeat.
+    """
+    row = await _stored_inbox(db_session, 7)
+    inbox = WebhookInboxRepository(db_session)
+
+    assert (await inbox.get_by_event_id(f.event_id(7))).id == row.id
+    assert await inbox.get_by_event_id("evt-does-not-exist") is None
+
+
+async def test_two_concurrent_claims_of_one_row_yield_one_claimed_and_one_locked(
+    db_session, second_session_factory
+):
+    """Plan note C3a, proven on genuinely independent connections.
+
+    db_session cannot show this: it wraps everything in one transaction, so two
+    "workers" on it would share a snapshot and neither would block. With two real
+    connections the second claim sees a committed live lease and is told "locked"
+    at once, rather than sending a second copy of the reply.
+    """
+    async with second_session_factory() as setup:
+        row = f.make_inbox(42)
+        setup.add(row)
+        await setup.commit()
+        row_id = row.id
+
+    try:
+        async with second_session_factory() as one, second_session_factory() as two:
+            first = await WebhookInboxRepository(one).claim(row_id, LEASE)
+            await one.commit()
+
+            second = await WebhookInboxRepository(two).claim(row_id, LEASE)
+            await two.commit()
+
+        assert first.state == "claimed"
+        assert second.state == "locked"
+    finally:
+        async with second_session_factory() as cleanup:
+            await cleanup.execute(sa.delete(WebhookInbox).where(WebhookInbox.id == row_id))
+            await cleanup.commit()
+
+
+# --- the reply row, and the status ladder -----------------------------------
+
+
+async def _conversation_with_inbound(session, tenant=f.TENANT_A):
+    contact = f.make_contact(tenant)
+    session.add(contact)
+    await session.flush()
+    conversation = f.make_conversation(contact)
+    session.add(conversation)
+    await session.flush()
+    inbound = f.make_message(conversation, provider_message_id=f.wamid(1))
+    session.add(inbound)
+    await session.flush()
+    return conversation, inbound
+
+
+async def test_reserving_a_reply_twice_returns_the_same_row(db_session):
+    """ON CONFLICT DO NOTHING, so a second job gets the first job's row.
+
+    No IntegrityError escapes, which matters twice over: the conflicting values
+    are the reply text and conversation ids (hard rule 8), and a failed INSERT
+    would abort the whole transaction (plan amendment A2), breaking the very
+    re-read this method performs.
+    """
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+
+    first = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+    second = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+
+    assert first.id == second.id
+    assert second.status == MessageStatus.QUEUED.value
+    assert second.provider_message_id is None
+
+
+async def test_the_session_still_works_after_a_duplicate_message_insert(db_session):
+    """Plan amendment A2, as a standalone proof.
+
+    In PostgreSQL a failed INSERT aborts the WHOLE transaction. Without the
+    savepoint in MessageRepository.add, catching DuplicateRecordError would leave
+    a session that raises InFailedSqlTransaction on the very re-read it was
+    caught to allow - and VS-004's job is built on exactly that re-read.
+    """
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+
+    with pytest.raises(DuplicateRecordError):
+        await messages.add(
+            conversation_id=conversation.id,
+            direction=MessageDirection.INBOUND,
+            modality=MessageModality.TEXT,
+            status=MessageStatus.RECEIVED,
+            provider_message_id=f.wamid(1),
+        )
+
+    # The session must still be usable, and must still see the original row.
+    found = await messages.get_by_provider_id(f.wamid(1))
+    assert found.id == inbound.id
+
+
+async def test_the_session_still_works_after_a_conversation_race(db_session):
+    """Plan amendment A2, for the path that deliberately keeps raising.
+
+    get_or_create_open's IntegrityError still propagates - VS-004's job turns it
+    into a retry - but the savepoint means the session it propagates through is
+    still usable, so the caller can roll back cleanly instead of hitting
+    InFailedSqlTransaction on its way out.
+    """
+    contact = f.make_contact()
+    db_session.add(contact)
+    await db_session.flush()
+    conversations = ConversationRepository(db_session, f.TENANT_A)
+    await conversations.get_or_create_open(contact.id, Channel.WHATSAPP)
+
+    # Force the race: insert a second open conversation behind the repository's
+    # check, which is what a concurrent worker does.
+    db_session.add(f.make_conversation(contact))
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+
+
+async def test_attaching_a_provider_id_marks_the_reply_sent_with_a_timestamp(db_session):
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+    reply = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+
+    await messages.attach_provider_id(reply.id, f.wamid(2))
+
+    stored = await messages.get_by_provider_id(f.wamid(2))
+    assert stored.id == reply.id
+    assert stored.status == MessageStatus.SENT.value
+    assert stored.sent_at is not None
+
+
+async def test_a_status_only_moves_forward(db_session):
+    """VS-004 requirement 5. Meta redelivers out of order as a matter of course.
+
+    The guard is in the WHERE clause, so a late "delivered" after "read" is a
+    no-op decided by the database rather than by a read-then-write in Python.
+    """
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+    reply = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+    await messages.attach_provider_id(reply.id, f.wamid(2))
+
+    assert await messages.advance_status(f.wamid(2), MessageStatus.DELIVERED) is True
+    assert await messages.advance_status(f.wamid(2), MessageStatus.READ) is True
+    assert await messages.advance_status(f.wamid(2), MessageStatus.DELIVERED) is False
+    assert await messages.advance_status(f.wamid(2), MessageStatus.READ) is False
+
+    stored = await messages.get_by_provider_id(f.wamid(2))
+    assert stored.status == MessageStatus.READ.value
+
+
+async def test_a_failed_status_overwrites_sent_but_not_delivered(db_session):
+    """The FAILED rank decision, both halves.
+
+    A send Meta later reports as failed must overwrite SENT; a message that was
+    actually delivered did not fail.
+    """
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+    reply = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+    await messages.attach_provider_id(reply.id, f.wamid(2))
+
+    assert await messages.advance_status(f.wamid(2), MessageStatus.FAILED) is True
+
+    await messages.advance_status(f.wamid(2), MessageStatus.DELIVERED)
+    assert await messages.advance_status(f.wamid(2), MessageStatus.FAILED) is False
+    stored = await messages.get_by_provider_id(f.wamid(2))
+    assert stored.status == MessageStatus.DELIVERED.value
+
+
+async def test_advancing_a_status_for_another_tenant_changes_nothing(db_session):
+    """The tenant filter is in the statement, not in the caller (hard rule 4)."""
+    conversation, inbound = await _conversation_with_inbound(db_session)
+    messages = MessageRepository(db_session, f.TENANT_A)
+    reply = await messages.reserve_reply(conversation.id, inbound.id, "Received")
+    await messages.attach_provider_id(reply.id, f.wamid(2))
+
+    other_tenant = MessageRepository(db_session, f.TENANT_B)
+    assert await other_tenant.advance_status(f.wamid(2), MessageStatus.READ) is False
+
+    stored = await messages.get_by_provider_id(f.wamid(2))
+    assert stored.status == MessageStatus.SENT.value

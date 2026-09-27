@@ -53,7 +53,10 @@ def test_enum_values_are_the_exact_strings_stored_in_the_database():
         "CLOSED",
     ]
     assert [d.value for d in MessageDirection] == ["INBOUND", "OUTBOUND"]
-    assert [m.value for m in MessageModality] == ["TEXT", "VOICE_NOTE"]
+    # OTHER was added in VS-004 (plan note C4): "store all inbound message
+    # types" needs a value for an image, a document or a location, and the CHECK
+    # was widened by a hand-written migration to match.
+    assert [m.value for m in MessageModality] == ["TEXT", "VOICE_NOTE", "OTHER"]
     assert [s.value for s in MessageStatus] == [
         "RECEIVED",
         "QUEUED",

@@ -39,9 +39,17 @@ class ConversationRepository(TenantScopedRepository):
 
         A concurrent writer can win between the check and the insert, in which
         case the partial unique index raises IntegrityError and it propagates
-        unchanged. That is deliberate: the caller (VS-004's job) should treat it
-        as retryable and re-read, not dead-letter. The conflicting values are
-        ids only, so the raw error is not a hard-rule-8 exposure.
+        unchanged. That is deliberate: the caller (VS-004's job) treats it as
+        retryable and re-reads, rather than dead-lettering. The conflicting
+        values are ids only, so the raw error is not a hard-rule-8 exposure.
+
+        The insert runs inside a SAVEPOINT (VS-004 plan amendment A2). In
+        PostgreSQL a failed INSERT aborts the WHOLE transaction, so without one
+        the IntegrityError would leave the caller's session unusable - every
+        subsequent statement raising InFailedSqlTransaction, including whatever
+        the caller does on its way out. begin_nested() rolls back only the failed
+        INSERT; the exception still propagates, and the session it propagates
+        through still works.
         """
         existing = await self.get_open(contact_id, channel)
         if existing is not None:
@@ -52,8 +60,9 @@ class ConversationRepository(TenantScopedRepository):
             channel=str(channel),
             state=ConversationState.AI_ACTIVE.value,
         )
-        self._session.add(conversation)
-        await self._session.flush()
+        async with self._session.begin_nested():
+            self._session.add(conversation)
+            await self._session.flush()
         return conversation
 
     async def set_state(

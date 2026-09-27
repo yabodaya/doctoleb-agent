@@ -93,3 +93,22 @@ def make_message(conversation: Conversation, **overrides: Any) -> Message:
     }
     values.update(overrides)
     return Message(**values)
+
+
+def make_reply(conversation: Conversation, inbound: Message, **overrides: Any) -> Message:
+    """An outbound reply linked to the inbound message it answers.
+
+    QUEUED with no provider_message_id: the state a reply row is reserved in,
+    before Meta has been asked anything (VS-004's commit boundary T1).
+    """
+    values: dict[str, Any] = {
+        "tenant_id": conversation.tenant_id,
+        "conversation_id": conversation.id,
+        "direction": MessageDirection.OUTBOUND.value,
+        "modality": MessageModality.TEXT.value,
+        "status": MessageStatus.QUEUED.value,
+        "text": "Received",
+        "reply_to_message_id": inbound.id,
+    }
+    values.update(overrides)
+    return Message(**values)

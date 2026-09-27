@@ -14,9 +14,10 @@ from app.db.repositories.errors import (
     as_duplicate,
 )
 from app.db.repositories.messages import MessageRepository
-from app.db.repositories.webhook_inbox import WebhookInboxRepository
+from app.db.repositories.webhook_inbox import ClaimResult, WebhookInboxRepository
 
 __all__ = [
+    "ClaimResult",
     "ContactRepository",
     "ConversationRepository",
     "DeadLetterJobRepository",

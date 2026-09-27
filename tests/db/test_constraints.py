@@ -201,3 +201,95 @@ async def test_stored_timestamps_come_back_timezone_aware(db_session):
     assert row.created_at.tzinfo is not None
     assert row.created_at.utcoffset() is not None
     assert abs(row.created_at - dt.datetime.now(dt.UTC)) < dt.timedelta(minutes=5)
+
+
+async def test_other_is_an_accepted_modality(db_session):
+    """The runtime half of widening the CHECK.
+
+    app/db/enums.py: autogenerate never compares CHECK constraints, so a new
+    enum value is a hand-written migration plus a test here. Without this, the
+    enum could say OTHER while the database still rejected it, and the failure
+    would land on a patient's image at 2am.
+    """
+    contact = f.make_contact()
+    db_session.add(contact)
+    await db_session.flush()
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    await db_session.flush()
+
+    db_session.add(f.make_message(conversation, modality="OTHER", text=None))
+    await db_session.flush()
+
+
+async def test_an_unknown_modality_is_still_rejected(db_session):
+    """Proves the CHECK was WIDENED and not dropped.
+
+    Inserted through Core so the ORM does not coerce the value first.
+    """
+    contact = f.make_contact()
+    db_session.add(contact)
+    await db_session.flush()
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    await db_session.flush()
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            sa.insert(Message).values(
+                id=f.uuid.uuid4(),
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+                direction="INBOUND",
+                modality="HOLOGRAM",
+                status="RECEIVED",
+            )
+        )
+
+
+async def test_one_inbound_message_can_have_only_one_reply(db_session):
+    """VS-004 requirement 3, at the only layer that can actually guarantee it.
+
+    Two jobs racing to answer one message must not both get a reply row. The
+    unique constraint decides, so no code path has to check first.
+    """
+    contact = f.make_contact()
+    db_session.add(contact)
+    await db_session.flush()
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    await db_session.flush()
+    inbound = f.make_message(conversation)
+    db_session.add(inbound)
+    await db_session.flush()
+
+    db_session.add(f.make_reply(conversation, inbound))
+    await db_session.flush()
+
+    db_session.add(f.make_reply(conversation, inbound))
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+
+
+async def test_many_messages_can_have_a_null_reply_link(db_session):
+    """Nullable AND unique is the whole point (VS-004 plan note C5).
+
+    PostgreSQL permits many NULLs under a unique constraint, which is what lets
+    every inbound row and every non-reply outbound row coexist. Without this
+    test, someone "tidying up" the column to NOT NULL would break every inbound
+    insert in the system and the reply test above would still pass.
+    """
+    contact = f.make_contact()
+    db_session.add(contact)
+    await db_session.flush()
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    await db_session.flush()
+
+    db_session.add_all([f.make_message(conversation) for _ in range(3)])
+    await db_session.flush()
+
+    count = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.reply_to_message_id.is_(None))
+    )
+    assert count == 3

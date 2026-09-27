@@ -50,6 +50,10 @@ Consequences, all of them implemented below:
 
 *Consequence:* the lease is wall-clock, and it is PostgreSQL's clock, not a worker's — `now()` is evaluated server-side in the same statement, so a worker with a skewed clock cannot shorten or extend its own lease. A worker killed with `SIGKILL` leaves a live lease behind, and its event waits out the remainder before a retry picks it up: a bounded delay, which is the correct trade against a duplicate reply.
 
+**C3b (amendment A1). The claim commits on its own, immediately, before any of the job's own work begins.** A claim held inside the job's transaction is rolled back with it on every retryable error, taking `attempts + 1` with it — so the dead letter under-reports — and it keeps the row write-locked for the whole transaction, so a concurrent worker blocks instead of getting `locked` at once. See "Commit boundaries".
+
+**C3c (amendment A2). No "duplicate insert, then re-read" path may abort the transaction it is in.** In PostgreSQL a failed `INSERT` aborts the whole transaction, so the re-read an `except IntegrityError` block exists to perform is the statement that fails. Every such path here is either `ON CONFLICT DO NOTHING` or wrapped in a `SAVEPOINT`; the table in "Commit boundaries" names which is which and why.
+
 **C4. "Store all inbound message types" is currently impossible.** `messages.modality` has a CHECK constraint allowing `TEXT` and `VOICE_NOTE` only (`ck_messages_modality_valid`). An image, document, location, sticker, contact card or interactive reply has neither. *Resolved: widen the CHECK with `OTHER`* in the Task 2 migration. `app/db/enums.py`'s own docstring prescribes exactly this — "Swapping a CHECK constraint is fully reversible … a hand-written migration plus a new value in the runtime test in `tests/db/test_constraints.py`". Audio keeps `VOICE_NOTE`, so a voice note stored here is already the right shape for VS-008 to attach a transcript to.
 
 **C5. There is no column linking a reply to the message it answers.** Requirement 3's "unique constraint allowing one reply per inbound message" needs one. *Resolved: add `messages.reply_to_message_id` (nullable `Uuid`, self-FK, `ON DELETE CASCADE`) with `uq_messages_reply_to_message_id` over it.* Nullable plus unique is exactly right in PostgreSQL: many NULLs are permitted, so every inbound row and every future non-reply outbound row is unaffected, while two replies to one inbound message are impossible at the database level rather than by our checking first.
@@ -141,14 +145,15 @@ The one exception to releasing the lease is the `locked` row: it belongs to anot
 
 ## Commit boundaries
 
-This is the part of the slice that correctness actually rests on. A message job has **exactly two commits**, and what sits between them is the one Meta call.
+This is the part of the slice that correctness actually rests on. A message job has **exactly three commits**: the claim on its own, then T1, then T2 — and what sits between the last two is the one Meta call.
 
 ```
-  T1  claim the inbox row          UPDATE ... WHERE status <> 'PROCESSED'
+  T0  claim the inbox row          UPDATE ... WHERE status <> 'PROCESSED'
                                      AND (locked_until IS NULL OR locked_until < now())
                                    SET PROCESSING, attempts + 1,
                                        locked_until = now() + timeout + margin
-      attach the resolved tenant
+      ---------------------------------------------------------------- COMMIT
+  T1  attach the resolved tenant
       upsert contact + identity
       get-or-create open conversation
       store the inbound message    (INBOUND, RECEIVED, provider_message_id = wamid)
@@ -162,13 +167,26 @@ This is the part of the slice that correctness actually rests on. A message job 
       ---------------------------------------------------------------- COMMIT
 ```
 
+**Why the claim commits on its own, before T1 begins (amendment A1).** Left inside T1, the claim is rolled back with T1 on any retryable error — and two separate things break. First, `attempts + 1` is undone, so a job that failed five times reports one attempt in its dead letter and the retry curve becomes invisible. Second, the row stays write-locked by the uncommitted `UPDATE` for the whole of T1, so a concurrent worker **blocks** on it — for a tenant lookup, a contact upsert and a conversation read — instead of being told `locked` immediately and deferring. The lease only does its job if the fact of the lease is visible to other transactions, and in PostgreSQL that means committed.
+
+*Consequence:* a job that dies between T0 and T1 leaves a claimed row with an incremented attempt count and no work done. That is exactly right — the lease expires, the next try reclaims it, and the attempt count is the truth.
+
 Why the reply row is committed **before** the send: if it were written in the same transaction as the wamid, a crash during the send would leave no trace that a send was ever attempted, and the retry would have nothing to recognise. Committed first, the row is a durable "a reply to this message is in flight", and it is the thing the unique constraint uses to stop a second job from starting a second reply.
 
 Why the inbox row is marked `PROCESSED` only in T2: mark it earlier and a crash during the send makes the retry skip the send entirely — a patient message silently unanswered. The inbox row stays `PROCESSING` across the Meta call on purpose, which is also why `claim()` tests `status <> 'PROCESSED'` and not `status = 'RECEIVED'`.
 
 And that is precisely why the lease exists (C3a): `PROCESSING` has to stay claimable for the dead try, so something other than `status` must distinguish a dead try from a live one. `locked_until` is that something, and it spans the Meta call — which is the interval a second concurrent run would otherwise duplicate.
 
-A status job has one commit and no Meta call.
+A status job has the claim commit and one more, and no Meta call.
+
+**No "duplicate insert, then re-read" may abort the transaction it is in (amendment A2).** In PostgreSQL a failed `INSERT` aborts the *whole* transaction, so catching an `IntegrityError` and carrying on is a trap: the very next statement — including the re-read the `except` block was written to allow — raises `InFailedSqlTransaction`. Every such path in this slice is therefore one of two shapes, and `tests/db/test_repositories.py` proves the session survives each:
+
+| Path | Shape | Why |
+|---|---|---|
+| contact + identity | `ON CONFLICT DO NOTHING` | VS-002 already; nothing fails, so nothing aborts |
+| reply row | `ON CONFLICT DO NOTHING` | Task 2's `reserve_reply`; same reason, and no exception quotes the reply text |
+| inbound message | `SAVEPOINT` (`session.begin_nested()`) | `MessageRepository.add` must keep raising `DuplicateRecordError` — it is a real signal, and the job re-reads the existing row on it. The savepoint rolls back the failed `INSERT` only |
+| open conversation | `SAVEPOINT` | `get_or_create_open` deliberately keeps propagating `IntegrityError` (the job retries on it), but the session it propagates through has to still work |
 
 ---
 
@@ -522,7 +540,8 @@ One migration: the reply link, the claim lease, the widened modality CHECK, and 
 - Create: `migrations/versions/<rev>_vs004_reply_link_inbox_lease_and_modality.py`
 - Modify: `app/db/repositories/webhook_inbox.py` (`get_by_event_id`, `claim`, `release`, `ClaimResult`)
 - Modify: `app/db/repositories/messages.py` (`reserve_reply`, `get_reply_to`, `attach_provider_id`, `advance_status`)
-- Test: `tests/db/test_constraints.py` (+4), `tests/db/test_models.py` (+2), `tests/db/test_migrations.py` (+1), `tests/db/test_repositories.py` (+13)
+- Modify: `app/db/repositories/messages.py` and `app/db/repositories/conversations.py` (amendment A2 savepoints)
+- Test: `tests/db/test_constraints.py` (+4), `tests/db/test_models.py` (+2), `tests/db/test_migrations.py` (+1), `tests/db/test_repositories.py` (+19), `tests/db/test_base.py` (the pinned modality list gains `OTHER`)
 
 **Interfaces:**
 - `MessageModality.OTHER = "OTHER"`; `STATUS_RANK: dict[MessageStatus, int]`
@@ -536,7 +555,7 @@ One migration: the reply link, the claim lease, the widened modality CHECK, and 
 - `MessageRepository.attach_provider_id(message_id, provider_message_id) -> None`
 - `MessageRepository.advance_status(provider_message_id, status) -> bool`
 
-**Expected tests after this task: 161.**
+**Expected tests after this task: 161** (actual: 168 — the amendments brought their own tests)**.**
 
 `claim()` takes the **row UUID**, not `provider_event_id` (C2). `get_by_event_id` still exists, and has exactly one caller: the webhook's duplicate path, which needs the row id of an item `store_if_new` refused to insert.
 
@@ -564,6 +583,10 @@ One migration: the reply link, the claim lease, the widened modality CHECK, and 
 - `test_a_row_with_a_live_lease_is_not_claimable` — the state is `locked`, and `attempts` is **not** incremented: another worker's try is not this job's try.
 - `test_a_row_with_an_expired_lease_is_claimable` — set `locked_until` to a past value; the claim succeeds. Without this, one `SIGKILL` would strand a patient's message forever.
 - `test_releasing_clears_the_lease_without_touching_the_status` — the release runs on the retry path, where the row must stay `PROCESSING`.
+- `test_marking_a_row_processed_also_clears_the_lease` — `mark()` clears `locked_until` in the same `UPDATE`. Every caller of it is a worker finishing with the row, and a lease left on a finished row is pure delay for whoever touches it next.
+- `test_get_by_event_id_finds_the_row_the_webhook_could_not_insert` — the webhook's duplicate path (C2).
+- `test_the_session_still_works_after_a_duplicate_message_insert` — **amendment A2**, standalone: catch `DuplicateRecordError`, then re-read the existing row on the same session. Without the savepoint in `MessageRepository.add` the re-read raises `InFailedSqlTransaction`, and VS-004's job is built on exactly that re-read.
+- `test_the_session_still_works_after_a_conversation_race` — amendment A2 for the path that deliberately keeps raising.
 - `test_two_concurrent_claims_of_one_row_yield_one_claimed_and_one_locked` — uses `second_session_factory` (VS-002 added it for exactly this) so the two claims are on genuinely independent connections and cannot see each other's uncommitted rows. **This is C3a's bug, proven fixed at the layer that fixes it.**
 - `test_reserving_a_reply_twice_returns_the_same_row` — the second call returns the first row, and no `IntegrityError` escapes (the conflicting values would be patient content).
 - `test_attaching_a_provider_id_marks_the_reply_sent_with_a_timestamp`
