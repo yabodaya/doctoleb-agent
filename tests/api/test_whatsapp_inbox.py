@@ -201,3 +201,41 @@ async def test_every_row_from_one_post_lands_in_one_transaction(
     assert len(calls) == 2
     # The first insert really happened, and was rolled back with the second.
     assert await _event_ids(use_database) == []
+
+
+async def test_a_failing_rollback_still_answers_503_and_leaks_nothing(
+    client, configure, use_database, monkeypatch, caplog
+):
+    """The failure inside the failure.
+
+    A rollback can fail in its own right - a connection dropped mid transaction
+    is the ordinary case - and it fails precisely when the storage error has
+    already happened. If that second exception escaped, Starlette would never see
+    our HTTPException: the response would be an unhandled 500 and uvicorn would
+    print a traceback carrying the ORIGINAL storage error as __context__, message
+    and all. That is the exact leak the 503 branch exists to prevent, arriving
+    through the back door.
+
+    The normal client again: an escaping exception fails this test rather than
+    being rendered as a plausible 500.
+    """
+
+    async def boom(self, provider_event_id, payload, provider="whatsapp"):
+        raise RuntimeError(f"invalid input syntax for type json, CONTEXT: {PATIENT_TEXT}")
+
+    async def rollback_also_fails():
+        raise RuntimeError(f"connection is closed, last statement held {PATIENT_TEXT}")
+
+    monkeypatch.setattr("app.api.whatsapp.WebhookInboxRepository.store_if_new", boom)
+    monkeypatch.setattr(use_database, "rollback", rollback_also_fails)
+    raw, headers = signed(envelope(messages=[text_message(1)]))
+
+    with caplog.at_level(logging.ERROR):
+        response = await client.post(PATH, content=raw, headers=headers)
+
+    assert response.status_code == 503
+    # Both failures are recorded, by class name, and neither message is.
+    assert "whatsapp webhook storage failed" in caplog.text
+    assert "whatsapp webhook rollback failed" in caplog.text
+    assert PATIENT_TEXT not in caplog.text
+    assert PATIENT_TEXT not in response.text

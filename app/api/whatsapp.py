@@ -130,19 +130,34 @@ async def receive(
         # is durable, or none is.
         await session.commit()
     except Exception as error:
-        await session.rollback()
         # The exception CLASS NAME only, and nothing else, ever.
         #
         # hide_parameters=True on the engine keeps SQLAlchemy from appending the
         # bound parameters, but it does not touch what PostgreSQL itself puts in
         # the message: the CONTEXT line on an invalid jsonb value quotes a snippet
         # of the JSON, and here that JSON is a patient's message (hard rule 8).
+        # Logged before the rollback, so the original cause is recorded even if
+        # the rollback then fails too.
         logger.error("whatsapp webhook storage failed error=%s", type(error).__name__)
-        # 503, not a re-raise. Re-raising would answer 500 AND hand uvicorn's
+        try:
+            await session.rollback()
+        except Exception as rollback_error:
+            # A rollback can fail in its own right - a connection dropped mid
+            # transaction is the ordinary case. Letting it escape would replace
+            # our 503 with an unhandled 500 whose traceback carries the ORIGINAL
+            # storage error as its context, printed by uvicorn: exactly the leak
+            # this branch exists to prevent. Class name only, then carry on.
+            logger.error("whatsapp webhook rollback failed error=%s", type(rollback_error).__name__)
+        # 503, not a re-raise. Re-raising would answer 500 and hand uvicorn's
         # exception logger the full traceback, message included - which is the
         # leak above, written to the log by a component we do not control.
-        # `from None` clears __cause__ and __context__, so no formatter anywhere
-        # can walk back to the original exception.
+        #
+        # What actually keeps that traceback out of the logs is that Starlette
+        # handles HTTPException itself and turns it into an ordinary response, so
+        # nothing ever formats it as an unhandled error. `from None` is belt and
+        # braces on top: it sets __suppress_context__, so a formatter that did
+        # print this exception would not chain back to the storage error.
+        # It does NOT clear __context__ - the reference is still there.
         #
         # Still a retryable status: Meta treats 503 like 500 and redelivers, and
         # dedupe makes the retry safe. Answering 200 here would lose the message
