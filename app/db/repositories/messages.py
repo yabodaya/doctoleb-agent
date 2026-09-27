@@ -163,6 +163,32 @@ class MessageRepository(TenantScopedRepository):
             )
         )
 
+    async def mark_sent_without_id(self, message_id: uuid.UUID) -> None:
+        """Meta accepted this message but gave us no id we could read.
+
+        SENT, with provider_message_id left NULL. Not a retry: the message is
+        already on its way, and asking again sends a second copy. The cost is
+        that no status callback will ever match this row - see "The
+        duplicate-reply gap" in docs/plans/VS-004-plan.md.
+        """
+        await self._session.execute(
+            sa.update(Message)
+            .where(Message.id == message_id, Message.tenant_id == self.tenant_id)
+            .values(status=MessageStatus.SENT.value, sent_at=sa.func.now())
+        )
+
+    async def mark_failed(self, message_id: uuid.UUID) -> None:
+        """Meta refused this message permanently.
+
+        Hard rule 5's shape: the row says FAILED and carries no wamid, so nothing
+        anywhere claims the patient was told something they were not.
+        """
+        await self._session.execute(
+            sa.update(Message)
+            .where(Message.id == message_id, Message.tenant_id == self.tenant_id)
+            .values(status=MessageStatus.FAILED.value)
+        )
+
     async def advance_status(self, provider_message_id: str, status: MessageStatus) -> bool:
         """Move a message forward, never backwards (VS-004 requirement 5).
 

@@ -11,13 +11,29 @@ from dataclasses import dataclass
 from typing import Any
 
 from arq.worker import Retry
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.channels.whatsapp.client import MetaClient
-from app.channels.whatsapp.payloads import InboxItemKind
+from app.channels.whatsapp.client import MetaClient, SendOutcome
+from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind
 from app.config import Settings
-from app.db.enums import InboxStatus
-from app.db.repositories import DeadLetterJobRepository, WebhookInboxRepository
+from app.db.enums import (
+    Channel,
+    ConversationState,
+    InboxStatus,
+    MessageDirection,
+    MessageModality,
+    MessageStatus,
+)
+from app.db.repositories import (
+    ContactRepository,
+    ConversationRepository,
+    DeadLetterJobRepository,
+    MessageRepository,
+    WebhookInboxRepository,
+)
+from app.db.repositories.errors import DuplicateRecordError
 from app.tenants import TenantId, TenantMapError, TenantResolver, UnknownPhoneNumberError
 from app.worker.errors import PermanentJobError, RetryableJobError
 from app.worker.retrying import backoff_seconds
@@ -25,6 +41,11 @@ from app.worker.retrying import backoff_seconds
 logger = logging.getLogger(__name__)
 
 JOB_NAME = "process_inbox_event"
+
+# Hard rule 7: the states an AI reply is allowed in. HUMAN_REQUESTED still counts
+# - the patient has asked for a human but nobody has picked the thread up yet,
+# and going silent at that exact moment is the worst of both worlds.
+_AI_STATES = (ConversationState.AI_ACTIVE.value, ConversationState.HUMAN_REQUESTED.value)
 
 
 @dataclass(frozen=True)
@@ -276,9 +297,198 @@ async def _dead_letter(
         await session.commit()
 
 
-# Filled in by Tasks 7 and 8. Defined here so _handler_for can name them.
-async def handle_message(context: EventContext) -> str:  # pragma: no cover - Task 7
-    raise NotImplementedError
+# The reply VS-004 sends. A constant, not a setting (plan assumption A4): it is
+# temporary by the slice's own words and VS-005 deletes it, so a knob here is a
+# knob nobody will ever turn on a value that is about to disappear.
+ACK_TEXT = "Received ✅"
+
+
+def _modality_for(message_type: str | None) -> MessageModality:
+    """Meta's `type` -> our modality.
+
+    audio is mapped HERE rather than in VS-008, so a voice note stored today is
+    already the right shape and VS-008 has a transcript to attach rather than a
+    backfill to write.
+
+    Everything else is OTHER. Inventing a modality per Meta feature would be a
+    CHECK migration per Meta feature, and the exact type stays readable in
+    webhook_inbox.payload either way.
+    """
+    if message_type == "text":
+        return MessageModality.TEXT
+    if message_type == "audio":
+        return MessageModality.VOICE_NOTE
+    return MessageModality.OTHER
+
+
+def _display_name_for(payload: dict[str, Any], wa_id: str) -> str | None:
+    """The WhatsApp profile name, matched to this message by wa_id.
+
+    It lives in the change's `contacts` array, not on the message (VS-003's
+    stored payload shape), and one change can carry several contacts.
+    """
+    contacts = payload.get("contacts")
+    if not isinstance(contacts, list):
+        return None
+    for entry in contacts:
+        if isinstance(entry, dict) and entry.get("wa_id") == wa_id:
+            profile = entry.get("profile")
+            name = profile.get("name") if isinstance(profile, dict) else None
+            return name if isinstance(name, str) else None
+    return None
+
+
+def _validated_message(item: Any) -> InboundMessage:
+    """The item as a message, or a permanent failure.
+
+    A hash-keyed inbox row (msg:sha256:...) lands here: VS-003 stores items it
+    could not read rather than dropping them, and this slice cannot process one,
+    because with no wamid there is nothing to make the inbound message idempotent
+    on. Dead-lettering it is what VS-003's assumption A1 predicted.
+    """
+    if not isinstance(item, dict):
+        raise PermanentJobError("unmodelled_message")
+    try:
+        return InboundMessage.model_validate(item)
+    except ValidationError:
+        raise PermanentJobError("unmodelled_message") from None
+
+
+async def handle_message(context: EventContext) -> str:
+    """Store the inbound message, then answer it exactly once.
+
+    Requirement 2: EVERY inbound type is stored; only the types in
+    WHATSAPP_REPLY_TO_TYPES get a reply. An image nobody answers is still a
+    message the clinic has to be able to see.
+
+    The order below is the correctness of the whole slice - see "Commit
+    boundaries" in docs/plans/VS-004-plan.md before changing it.
+
+    Every log line uses event_id=<webhook_inbox row uuid> (plan note C2). The
+    wamid is stored in messages.provider_message_id and never logged: it is
+    base64 and decodes to include the patient's phone number.
+    """
+    message = _validated_message(context.item)
+    wa_id = message.from_
+    if not wa_id:
+        # No sender means no contact, no conversation and nobody to reply to.
+        raise PermanentJobError("unmodelled_message")
+
+    reply_wanted = (message.type or "") in context.settings.reply_to_types
+    body = message.text.get("body") if isinstance(message.text, dict) else None
+
+    # --- T1 ---------------------------------------------------------------
+    async with context.sessionmaker() as session:
+        await WebhookInboxRepository(session).attach_tenant(context.event_id, context.tenant_id)
+
+        contacts = ContactRepository(session, context.tenant_id)
+        contact = await contacts.get_or_create_by_identity(
+            Channel.WHATSAPP, wa_id, display_name=_display_name_for(context.payload, wa_id)
+        )
+
+        conversations = ConversationRepository(session, context.tenant_id)
+        try:
+            conversation = await conversations.get_or_create_open(contact.id, Channel.WHATSAPP)
+        except IntegrityError:
+            # VS-002's follow-up, pulled in by requirement 2. Another worker won
+            # the race between the check and the insert; a retry re-reads and
+            # finds their conversation. Never dead-lettered, and the original
+            # exception is not chained - the constraint name is the most that
+            # should ever reach a log.
+            raise RetryableJobError("conversation_race") from None
+
+        messages = MessageRepository(session, context.tenant_id)
+        try:
+            inbound = await messages.add(
+                conversation_id=conversation.id,
+                direction=MessageDirection.INBOUND,
+                modality=_modality_for(message.type),
+                status=MessageStatus.RECEIVED,
+                text=body,
+                provider_message_id=message.id,
+            )
+        except DuplicateRecordError:
+            # Not a failure: a previous try already stored it. This is what makes
+            # the whole job re-runnable, and it only works because add() wraps its
+            # INSERT in a savepoint (plan amendment A2) - without one the failed
+            # INSERT would have aborted this transaction and the re-read below
+            # would raise InFailedSqlTransaction.
+            existing = await messages.get_by_provider_id(message.id)
+            if existing is None:  # pragma: no cover - the conflict proves it exists
+                raise RetryableJobError("inbound_message_vanished") from None
+            inbound = existing
+
+        conversation_id = conversation.id
+
+        if not reply_wanted:
+            await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+            await session.commit()
+            logger.info(
+                "inbound stored without a reply event_id=%s type=%s",
+                context.event_id,
+                message.type,
+            )
+            return "stored_no_reply"
+
+        # Hard rule 7, re-read from the database rather than trusted from the
+        # get-or-create above: a human may have taken this conversation over
+        # while the job was resolving a tenant.
+        current = await conversations.get(conversation_id)
+        if current is None or current.state not in _AI_STATES:
+            await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+            await session.commit()
+            # Ids only, never the message (hard rule 7's own wording).
+            logger.info(
+                "reply dropped, conversation not AI-active event_id=%s conversation_id=%s",
+                context.event_id,
+                conversation_id,
+            )
+            return "dropped_not_ai_active"
+
+        reply = await messages.reserve_reply(conversation_id, inbound.id, ACK_TEXT)
+        if reply.provider_message_id:
+            # A previous try already sent it. Requirement 3: do not send again.
+            await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+            await session.commit()
+            logger.info("reply already sent event_id=%s", context.event_id)
+            return "already_replied"
+
+        reply_id = reply.id
+        # COMMIT before touching Meta. A reply row written in the same
+        # transaction as the wamid would leave no trace of an attempted send, and
+        # the retry would have nothing to recognise.
+        await session.commit()
+
+    # --- the one Meta call -------------------------------------------------
+    result = await context.meta.send_text(context.phone_number_id, wa_id, ACK_TEXT)
+
+    if result.outcome is SendOutcome.RETRYABLE:
+        # The reply row stays QUEUED with no wamid, so the next try recognises it
+        # and sends again. This is the window the duplicate-reply gap lives in.
+        raise RetryableJobError(result.reason)
+
+    if result.outcome is SendOutcome.PERMANENT:
+        async with context.sessionmaker() as session:
+            await MessageRepository(session, context.tenant_id).mark_failed(reply_id)
+            await session.commit()
+        # Hard rule 5's shape: nothing is claimed to have been sent.
+        raise PermanentJobError(result.reason)
+
+    # --- T2 -----------------------------------------------------------------
+    async with context.sessionmaker() as session:
+        messages = MessageRepository(session, context.tenant_id)
+        if result.provider_message_id:
+            await messages.attach_provider_id(reply_id, result.provider_message_id)
+        else:
+            # accepted_without_id: Meta took the message and we cannot read the
+            # id it gave it. SENT, and never resent - see the client, and the
+            # plan's duplicate-reply gap.
+            await messages.mark_sent_without_id(reply_id)
+        await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+        await session.commit()
+
+    logger.info("replied event_id=%s conversation_id=%s", context.event_id, conversation_id)
+    return "replied" if result.provider_message_id else "sent_without_id"
 
 
 async def handle_status(context: EventContext) -> str:  # pragma: no cover - Task 8

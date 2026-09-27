@@ -1416,7 +1416,7 @@ Comment why the resolver is built at startup: a broken map then produces one sta
 - `ACK_TEXT = "Received ✅"`
 - `async def handle_message(session, meta, settings, tenant_id, row, payload) -> str`
 
-**Expected tests after this task: 244.**
+**Expected tests after this task: 244** (actual: 284)**.**
 
 - [ ] **Step 1: Write the failing message tests**
 
@@ -1445,7 +1445,11 @@ Replying exactly once:
 
 Hard rule 7 and privacy:
 - `test_a_human_active_conversation_drops_the_reply` — no Meta request, no reply row, outcome `dropped_not_ai_active`, and the log line carries the conversation id only.
-- `test_a_closed_conversation_drops_the_reply`
+- `test_a_closed_conversation_drops_the_reply` — **the plan's expectation here was wrong, and the test says what actually happens.** A `CLOSED` conversation frees VS-002's partial unique index, so `get_or_create_open` opens a NEW `AI_ACTIVE` conversation and the message is answered in it. That is the documented state machine (`docs/architecture.md`), not a hard-rule-7 bypass: rule 7 protects a conversation a human is holding, which is the `HUMAN_ACTIVE` case above. The test asserts the two conversations and the reply.
+- `test_a_send_accepted_without_an_id_is_not_resent` — the `sent_without_id` outcome end to end.
+- `test_a_retried_send_after_a_failure_reuses_the_same_reply_row` — amendment A2's payoff: the second try re-stores nothing and reserves nothing, and exactly one inbound and one reply row exist afterwards.
+- `test_a_dropped_reply_logs_ids_only` — hard rule 7's own wording.
+- `test_a_message_with_no_sender_dead_letters`
 - `test_the_state_is_re_read_immediately_before_the_send` — flip the state to `HUMAN_ACTIVE` after the inbound message is stored; the reply is still dropped (Review Focus 10).
 - `test_no_log_line_from_the_message_path_contains_patient_content` — `caplog` against `PATIENT_TEXT`, `PROFILE_NAME`, `phone()` and `wamid()` (C2).
 
