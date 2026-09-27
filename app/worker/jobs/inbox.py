@@ -16,7 +16,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.channels.whatsapp.client import MetaClient, SendOutcome
-from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind
+from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind, StatusUpdate
+from app.channels.whatsapp.redact import scrub
 from app.config import Settings
 from app.db.enums import (
     Channel,
@@ -491,5 +492,103 @@ async def handle_message(context: EventContext) -> str:
     return "replied" if result.provider_message_id else "sent_without_id"
 
 
-async def handle_status(context: EventContext) -> str:  # pragma: no cover - Task 8
-    raise NotImplementedError
+# Meta's status words, mapped to our vocabulary. Anything not in here is ignored
+# rather than dead-lettered (plan assumption A12): Meta adds status values without
+# notice, and a dead letter per unrecognised word would fill a triage table with
+# things nobody will ever act on.
+_STATUS_WORDS: dict[str, MessageStatus] = {
+    "sent": MessageStatus.SENT,
+    "delivered": MessageStatus.DELIVERED,
+    "read": MessageStatus.READ,
+    "failed": MessageStatus.FAILED,
+}
+
+
+def _validated_status(item: Any) -> StatusUpdate:
+    """The item as a status callback, or a permanent failure."""
+    if not isinstance(item, dict):
+        raise PermanentJobError("unmodelled_status")
+    try:
+        return StatusUpdate.model_validate(item)
+    except ValidationError:
+        raise PermanentJobError("unmodelled_status") from None
+
+
+def _failure_codes(item: Any) -> str:
+    """Meta's error codes from a `failed` callback, sanitised.
+
+    Codes only, never `error.message` or `error.title`: those are written for a
+    human and quote the recipient's number for the most common failure there is
+    (hard rule 8, requirement 6).
+    """
+    errors = item.get("errors") if isinstance(item, dict) else None
+    if not isinstance(errors, list):
+        return ""
+    codes = [
+        f"code_{entry['code']}"
+        for entry in errors
+        if isinstance(entry, dict) and isinstance(entry.get("code"), int)
+    ]
+    return scrub(" ".join(codes))
+
+
+async def handle_status(context: EventContext) -> str:
+    """Advance one outbound message's delivery status.
+
+    Look the message up FIRST, then advance. The lookup is not redundant with
+    advance_status's return value - they answer different questions. "No such
+    wamid" means the status arrived before the worker saved it, which is Meta's
+    ordinary out-of-order delivery and is retryable. "Found, but did not move"
+    means the status was old or repeated, and is a success. One boolean cannot
+    distinguish those, and treating them alike would either lose a real status or
+    dead-letter a duplicate one.
+
+    The wamid is read out of the payload and never logged (plan note C2): here it
+    is the id of a message WE sent TO the patient, so it identifies them twice
+    over. Log lines carry event_id, the status word, and whether the row moved.
+    """
+    status = _validated_status(context.item)
+    target = _STATUS_WORDS.get(status.status.lower())
+
+    async with context.sessionmaker() as session:
+        inbox = WebhookInboxRepository(session)
+        await inbox.attach_tenant(context.event_id, context.tenant_id)
+
+        if target is None:
+            # A status value we do not model. PROCESSED, not dead-lettered (A12).
+            await inbox.mark(context.event_id, InboxStatus.PROCESSED)
+            await session.commit()
+            logger.info("status ignored event_id=%s status=%s", context.event_id, status.status)
+            return "status_ignored"
+
+        messages = MessageRepository(session, context.tenant_id)
+        if await messages.get_by_provider_id(status.id) is None:
+            # Requirement 5: the status webhook can arrive before the worker has
+            # saved the wamid. Retryable, and the commit above is discarded with
+            # the rollback - attach_tenant will run again on the next try.
+            #
+            # Assumption A11's consequence: a status for a message we never sent
+            # retries through the whole curve and then dead-letters as
+            # status_before_wamid. Noisy but honest.
+            raise RetryableJobError("status_before_wamid")
+
+        moved = await messages.advance_status(status.id, target)
+        await inbox.mark(context.event_id, InboxStatus.PROCESSED)
+        await session.commit()
+
+    if target is MessageStatus.FAILED:
+        codes = _failure_codes(context.item)
+        logger.warning(
+            "outbound message failed event_id=%s moved=%s codes=%s",
+            context.event_id,
+            moved,
+            codes,
+        )
+    else:
+        logger.info(
+            "status advanced event_id=%s status=%s moved=%s",
+            context.event_id,
+            target.value,
+            moved,
+        )
+    return "status_advanced" if moved else "status_not_moved"

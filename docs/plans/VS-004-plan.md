@@ -1507,11 +1507,11 @@ async def handle_message(...) -> str:
 - `async def handle_status(session, tenant_id, row, payload) -> str`
 - `_STATUS_WORDS: dict[str, MessageStatus]` — `sent`, `delivered`, `read`, `failed`
 
-**Expected tests after this task: 256.**
+**Expected tests after this task: 256** (actual: 298)**.**
 
 - [ ] **Step 1: Write the failing status tests**
 
-- `test_a_sent_callback_marks_the_reply_sent`
+- `test_a_sent_callback_marks_the_reply_sent` — note what it actually asserts: the outcome is **`status_not_moved`**, because `attach_provider_id` already set `SENT` when the send succeeded. A `sent` callback for a message we sent ourselves is a no-op that succeeds, which is the correct answer and not an error. The plan implied `status_advanced` here; the handler therefore returns two success codes, `status_advanced` and `status_not_moved`, rather than one.
 - `test_delivered_and_read_advance_in_order`
 - `test_a_delivered_callback_after_read_changes_nothing` — requirement 5's "never read → delivered", the case Meta's out-of-order delivery produces routinely.
 - `test_a_repeated_read_callback_changes_nothing`
@@ -1521,7 +1521,8 @@ async def handle_message(...) -> str:
 - `test_the_same_status_job_succeeds_once_the_wamid_is_stored` — proves the retry is not merely tolerated but useful.
 - `test_a_status_for_an_unknown_wamid_dead_letters_after_max_tries` — A11's consequence, stated in a test so it is not a surprise in production.
 - `test_a_status_word_we_do_not_model_is_ignored_not_dead_lettered` — A12; the row still reaches `PROCESSED`.
-- `test_a_status_for_another_tenants_message_does_not_advance_it` — `MessageRepository` is tenant-scoped; this proves the scoping is not bypassed.
+- `test_a_status_for_another_tenants_message_does_not_advance_it` — `MessageRepository` is tenant-scoped; this proves the scoping is not bypassed. It lands on the **`status_before_wamid` retry** rather than on `advance_status` returning `False`, which is right: from the wrong tenant's point of view that wamid genuinely does not exist.
+- `test_a_status_item_that_fails_its_model_dead_letters` — `unmodelled_status`, the counterpart of the message path's `unmodelled_message`.
 - `test_a_failed_callback_logs_the_meta_error_code_and_nothing_else` — `item["errors"]` through `scrub`; no `error.message`, no `recipient_id`.
 - `test_no_status_log_line_contains_the_wamid_it_is_about` — **C2, and the status handler is where it is most tempting**: the obvious debug line is "status X for wamid Y", and that wamid is the id of a message *we sent to the patient*. The handler logs `event_id=<row uuid> status=<word> moved=<bool>` instead, which is enough to trace a status through a log without naming anyone.
 
