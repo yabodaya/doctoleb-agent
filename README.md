@@ -83,9 +83,13 @@ the retry safe.
 ### Testing it locally, without Meta
 
 ```powershell
-$env:META_APP_SECRET = "whatever-you-put-in-.env"
 uv run python scripts/sign_webhook.py "local smoke test"
 ```
+
+It signs with the `META_APP_SECRET` already in your `.env`, read through
+`app.config` - the same value the app verifies against. Do not export the secret
+into your shell to do this: PowerShell's PSReadLine writes every command you type
+to a plaintext history file that outlives the session.
 
 Unsigned requests are the other half of the check — this must answer `401`:
 

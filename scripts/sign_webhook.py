@@ -1,11 +1,14 @@
 """POST a synthetic WhatsApp webhook to a local instance, correctly signed.
 
-    export META_APP_SECRET=...              # bash
-    $env:META_APP_SECRET = "..."            # PowerShell
     uv run python scripts/sign_webhook.py "hello from the test phone"
 
-Hard rule 9: the secret comes from the environment, never from an argument (a
-command line is visible to other processes and lands in shell history).
+Hard rule 9: the secret is read from .env through app.config, the same place the
+app reads it, and never from an argument or from a shell you typed it into. A
+command line is visible to other processes, and on Windows PowerShell's
+PSReadLine writes every command to a plaintext history file that survives the
+session - so `$env:META_APP_SECRET = "..."` would persist the real App Secret to
+disk in a file nobody remembers to clean.
+
 Hard rule 8: the text is whatever you pass; keep it synthetic, and never paste a
 real patient message here.
 """
@@ -17,13 +20,17 @@ import os
 import sys
 import urllib.request
 
+from app.config import get_settings
+
 URL = os.environ.get("WEBHOOK_URL", "http://localhost:8000/webhooks/whatsapp")
 
 
 def main() -> int:
-    secret = os.environ.get("META_APP_SECRET", "")
+    # Same source as the running app, so a mismatch between what signs the
+    # request and what verifies it is impossible by construction.
+    secret = get_settings().meta_app_secret
     if not secret:
-        print("META_APP_SECRET is not set; the endpoint would answer 401", file=sys.stderr)
+        print("META_APP_SECRET is empty in .env; the endpoint would answer 401", file=sys.stderr)
         return 2
 
     text = sys.argv[1] if len(sys.argv) > 1 else "hello from scripts/sign_webhook.py"
