@@ -33,3 +33,18 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+@pytest.fixture
+def client_for():
+    """An async-context client factory for a caller-built app.
+
+    The `client` fixture covers the common case (the `app` fixture's app). Tests
+    that need an app configured differently — a different APP_ENV, different Meta
+    secrets — build it themselves and wrap it with this.
+    """
+
+    def build(app):
+        return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+    return build
