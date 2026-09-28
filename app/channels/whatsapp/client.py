@@ -1,9 +1,11 @@
 """The Meta WhatsApp Cloud API client: one attempt, one timeout, one classifier.
 
 Hard rule 11: every external call has a timeout and bounded retries. The bound
-lives in the job, not here — see `MetaClient.send_text`.
+lives in the job, not here — see `MetaClient.send_text`. The timeout is a
+WALL-CLOCK deadline, not httpx's per-phase one (VS-005 amendment A2).
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
@@ -76,12 +78,31 @@ def classify_exception(error: Exception) -> SendOutcome | None:
     accepted the message. Calling it permanent would trade a rare duplicate reply
     for a routine silent loss, which is the worse of the two (see "The
     duplicate-reply gap" in docs/plans/VS-004-plan.md).
+
+    The built-in TimeoutError is OUR OWN deadline firing (VS-005 amendment A2),
+    not httpx's. It has to be listed, or send_text would re-raise it as though
+    it were a bug in our code - which is the one thing the None return exists to
+    let through.
     """
     if isinstance(error, httpx.TimeoutException):
         return SendOutcome.RETRYABLE
     if isinstance(error, httpx.TransportError):
         return SendOutcome.RETRYABLE
+    if isinstance(error, TimeoutError):
+        return SendOutcome.RETRYABLE
     return None
+
+
+def _transport_reason(error: Exception) -> str:
+    """A short code for a failure that never reached a status line.
+
+    Our own deadline gets `http_timeout` rather than `transport_TimeoutError`:
+    it is the same family of fact as `http_429`, it reads as a timeout in a
+    dead letter, and it is what the README's triage table names.
+    """
+    if isinstance(error, TimeoutError) and not isinstance(error, httpx.TimeoutException):
+        return "http_timeout"
+    return f"transport_{type(error).__name__}"
 
 
 class MetaClient:
@@ -130,18 +151,27 @@ class MetaClient:
         }
         headers = {"Authorization": f"Bearer {self._settings.meta_access_token}"}
 
+        deadline = self._settings.meta_send_timeout_seconds
         try:
-            response = await self._http.post(
-                self._url(phone_number_id),
-                json=payload,
-                headers=headers,
-                timeout=self._settings.meta_send_timeout_seconds,
-            )
+            # asyncio.timeout on top of httpx's, because httpx's float applies
+            # PER CONNECTION PHASE - connect, write, read and pool each get the
+            # whole value - so one send can legitimately take several times
+            # META_SEND_TIMEOUT_SECONDS (VS-005 amendment A2). JOB_TIMEOUT_SECONDS
+            # is supposed to cover OPENAI_TIMEOUT_SECONDS plus this, and a job
+            # arq times out is finished as FAILED and never retried: no dead
+            # letter, no lease release, the event simply stranded.
+            async with asyncio.timeout(deadline):
+                response = await self._http.post(
+                    self._url(phone_number_id),
+                    json=payload,
+                    headers=headers,
+                    timeout=deadline,
+                )
         except Exception as error:  # noqa: BLE001 - re-raised unless it is ours
             outcome = classify_exception(error)
             if outcome is None:
                 raise
-            reason = f"transport_{type(error).__name__}"
+            reason = _transport_reason(error)
             logger.warning("meta send failed phone_number_id=%s reason=%s", phone_number_id, reason)
             return SendResult(outcome, reason=reason)
 

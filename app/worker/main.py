@@ -1,8 +1,9 @@
 """arq worker entrypoint: `arq app.worker.main.WorkerSettings`.
 
 Run as its own process, separate from the api, so slow work never happens inside
-a webhook request (hard rule 1). This is where the first genuinely slow thing in
-the repo lives — the Meta call — and it lives on the far side of the queue.
+a webhook request (hard rule 1). This is where the two genuinely slow things in
+the repo live — the OpenAI call and the Meta call — and they live on the far
+side of the queue.
 """
 
 import logging
@@ -13,8 +14,9 @@ from arq.connections import RedisSettings
 from arq.worker import func
 
 from app.channels.whatsapp.client import MetaClient
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db.session import dispose_engine, get_sessionmaker
+from app.integrations.openai.chat import OpenAIChatClient
 from app.logging_config import configure_logging
 from app.tenants import ConfigTenantResolver
 from app.worker.jobs import process_inbox_event
@@ -33,6 +35,34 @@ async def ping(ctx: dict[str, Any]) -> str:
     return "pong"
 
 
+def startup_warnings(settings: Settings) -> list[str]:
+    """What an operator needs to hear once per worker start. Names and numbers,
+    never secrets (hard rule 9).
+
+    Without the first two, "every reply is the fallback" looks like a bug rather
+    than a missing .env entry. Without the third, a slow reply is cut off by
+    arq's job timeout and stranded with no dead letter (plan assumption A14).
+
+    Warnings rather than a boot failure, deliberately: VS-004's assumption A1
+    chose a loud runtime signal over a dead process for configuration mistakes,
+    and the api must not refuse to boot over a worker knob.
+    """
+    warnings: list[str] = []
+    if not settings.openai_api_key:
+        warnings.append("OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY")
+    if not settings.openai_chat_model.strip():
+        warnings.append("OPENAI_CHAT_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY")
+    budget = settings.openai_timeout_seconds + settings.meta_send_timeout_seconds
+    if settings.job_timeout_seconds <= budget:
+        warnings.append(
+            f"JOB_TIMEOUT_SECONDS={settings.job_timeout_seconds:g} does not exceed "
+            f"OPENAI_TIMEOUT_SECONDS={settings.openai_timeout_seconds:g} + "
+            f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g}: "
+            "a slow reply can be cut off mid-send"
+        )
+    return warnings
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     """Build everything the jobs share, once per process.
 
@@ -46,16 +76,26 @@ async def startup(ctx: dict[str, Any]) -> None:
     """
     configure_logging()
     settings = get_settings()
+    for warning in startup_warnings(settings):
+        logger.warning(warning)
     http = httpx.AsyncClient()
     ctx["settings"] = settings
     ctx["sessionmaker"] = get_sessionmaker()
     ctx["http"] = http
     ctx["meta"] = MetaClient(http, settings)
+    # One chat client per process (plan assumption A9), holding the SDK's own
+    # httpx2 pool - a separate stack from the httpx client above. Built even
+    # without a key: it reports openai_api_key_unset instead of failing to
+    # construct, so the worker boots with no OpenAI account at all.
+    ctx["chat"] = OpenAIChatClient(settings)
     ctx["resolver"] = ConfigTenantResolver.from_settings(settings)
     logger.info("worker started")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    chat: OpenAIChatClient | None = ctx.get("chat")
+    if chat is not None:
+        await chat.aclose()
     http: httpx.AsyncClient | None = ctx.get("http")
     if http is not None:
         await http.aclose()
@@ -73,6 +113,10 @@ class WorkerSettings:
         # timeout must stay below the claim lease, or the lease expires while the
         # job is still inside the Meta call and a second worker sends the same
         # reply - Settings.claim_lease_seconds derives itself to guarantee that.
+        # It must also stay ABOVE openai_timeout_seconds + meta_send_timeout_seconds,
+        # which startup_warnings() checks: a job arq times out is finished as
+        # failed, our except blocks never run, and the event is stranded with no
+        # dead letter.
         func(
             process_inbox_event,
             name="process_inbox_event",

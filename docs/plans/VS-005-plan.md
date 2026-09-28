@@ -328,7 +328,7 @@ Twelve things the slice implies but does not spell out. Each has a test in the t
 9. **Nothing sensitive reaches logs, job results, Redis or dead letters** — including the SDK's and the transports' own loggers at DEBUG (Tasks 2, 3, 6, 8).
 10. **No test can reach OpenAI** (Task 2's network block).
 11. **The app boots from a verbatim copy of `.env.example`** (Task 1).
-12. **The job timeout covers both network calls** (Task 1 test, Task 6 warning).
+11. **The job timeout covers both network calls** (Task 1 test, Task 6 warning).
 
 ---
 
@@ -1086,6 +1086,8 @@ The heart of the slice: the new order, the two hard-rule-7 reads, no transaction
 **Files:**
 - Modify: `app/worker/jobs/inbox.py` (`EventContext`, `process_inbox_event`, `handle_message`, `_drop`, `_history_entry`, delete `ACK_TEXT`)
 - Modify: `app/worker/main.py` (`ctx["chat"]`, `startup_warnings`, close on shutdown)
+- Modify: `app/channels/whatsapp/client.py` (**execution amendment A2**: a wall-clock deadline around the send, and `classify_exception` maps the built-in `TimeoutError`)
+- Test: `tests/channels/test_meta_client.py` (+2, amendment A2)
 - Modify: `tests/worker/conftest.py` (`job_context` gets a default `FakeChatClient`)
 - Modify: `tests/worker/test_inbox_message.py` (drop the `ACK_TEXT` import; assert the generated text; one docstring)
 - Test: `tests/worker/test_inbox_message.py` (+14), `tests/test_worker.py` (+4), `tests/api/test_route_exposure.py` (+1)
@@ -1247,6 +1249,17 @@ async def handle_message(context: EventContext) -> str:
 `_drop(session, context, inbound_id, conversation_id, failure)` is shared by both reads: if an unsent reply row exists it is marked `FAILED` (C9); when `failure` is set it records the dead letter (Task 7); then the inbox row goes `PROCESSED`, the session commits, and it logs VS-004's `reply dropped, conversation not AI-active` line with ids only. `_history_entry(row)` converts a `Message` into a `HistoryEntry` inside T1, while the session is open, so no ORM object crosses into the agent.
 
 `handle_message` imports `process_turn`, `Turn` and `HistoryEntry` from `app.agent` and `ChatOutcome` from `app.integrations.openai` — never the SDK.
+
+- [ ] **Step 4b (execution amendment A2): give the Meta send a wall-clock deadline too**
+
+The job-timeout invariant this slice pins is false for the Meta half until this is done. `MetaClient.send_text` passes `meta_send_timeout_seconds` to httpx as a float, and an httpx float timeout applies **per connection phase** — connect, write, read and pool each get the whole value — exactly the flaw C8/A4 found for the OpenAI SDK. So one send can exceed `META_SEND_TIMEOUT_SECONDS` several times over, `OPENAI_TIMEOUT_SECONDS` + a slow send can exceed `JOB_TIMEOUT_SECONDS`, and a job arq times out is finished as failed with none of our exit paths running: **the event is stranded with no dead letter**.
+
+- wrap the `post` in `asyncio.timeout(meta_send_timeout_seconds)`, keeping the httpx timeout as the inner, per-phase bound;
+- `classify_exception` maps the built-in `TimeoutError` to `RETRYABLE` — without it, our own deadline would be re-raised as though it were a bug in our code, which is the one thing the `None` return exists to let through;
+- the reason is `http_timeout`, not `transport_TimeoutError`: it is the same family of fact as `http_429`, and it is what the README's triage table names. `_transport_reason()` picks it, leaving httpx's own timeouts as `transport_ReadTimeout`.
+- tests: a stalling `httpx.MockTransport` is cut off at the deadline and classified `RETRYABLE` / `http_timeout` with exactly one attempt and no request reaching the handler; and `classify_exception(TimeoutError())` is `RETRYABLE`.
+
+VS-004 follow-up 11 is therefore **done**, and moves from Task 8's Follow-ups into its Notes.
 
 - [ ] **Step 5: Wire the worker**
 
@@ -1440,6 +1453,7 @@ Set `Status: PARTIAL` with one line: code complete; Task 9, the live test, has n
 - The prompt, its version and hash pin, and A15.
 - C5: `env_ignore_empty`, and that VS-004's `.env.example` did not boot before it.
 - C8: the SDK runs on httpx2; the logger pins; the network block.
+- Amendment A2: BOTH network calls are wall-clock deadlines now, because an httpx (and httpx2) float timeout is per connection phase. VS-004 follow-up 11 is done here, not deferred.
 - Whatever Task 9 teaches, appended there.
 
 Follow-ups must include, at minimum — the three the developer named first:
@@ -1457,10 +1471,9 @@ And the ones this slice found:
 8. **The fallback is one language by default** (A10).
 9. **The clinic's name and details in the prompt** — from the tenant or VS-006's `get_clinic_information`.
 10. **Staff messages in the AI's history**: when VS-010 lets staff reply, their `OUTBOUND` rows become `assistant` turns. Decide then whether that is right.
-11. **The Meta client's timeout is per connection phase too** (VS-004); the OpenAI client now shows the wall-clock pattern.
-12. **Cost visibility**: token counts are only in the logs; VS-006's `agent_runs` table is the natural home.
-13. **A reasoning-effort setting**, if the chosen model is a reasoning model and replies are slow (the SDK supports `reasoning_effort`).
-14. VS-004's sweeper follow-up, restated: an arq job **timeout** strands an event exactly like a kill on the last try.
+11. **Cost visibility**: token counts are only in the logs; VS-006's `agent_runs` table is the natural home.
+12. **A reasoning-effort setting**, if the chosen model is a reasoning model and replies are slow (the SDK supports `reasoning_effort`).
+13. VS-004's sweeper follow-up, restated: an arq job **timeout** strands an event exactly like a kill on the last try.
 
 - [ ] **Step 6: Explain the slice function by function**
 
@@ -1597,7 +1610,7 @@ If not: leave `PARTIAL`, and write down exactly which check failed and what the 
 | A retry sends the stored text; the model is never asked again (req. 2) | Task 6, Step 4 | Task 6 (`test_a_retry_after_a_failed_send_…`, `test_a_reply_reserved_by_an_earlier_try_…`); Task 7 (`test_a_retried_fallback_send_…`) |
 | Hard rule 7 immediately before the send, via `current_state` (req. 2, slice acceptance) | Task 6, Step 4 (T1b) | Task 6 (`test_a_takeover_during_generation_drops_the_reply`, `test_the_job_never_reads_the_state_through_conversation_get`) |
 | No transaction open during the model call or the Meta call (session rule) | Task 6, Step 4 | Task 6 (the two takeover tests with `lock_timeout`) |
-| Job timeout > OpenAI timeout + Meta timeout; the lease outlives the job (req. 2) | Task 1, Step 5; Task 6, Step 5 | Task 1 (`test_the_job_timeout_exceeds_the_openai_and_meta_timeouts_together`, VS-004's lease test); Task 6 (`test_startup_warns_when_the_job_timeout_…`) |
+| Job timeout > OpenAI timeout + Meta timeout; the lease outlives the job (req. 2) | Task 1, Step 5; Task 6, Steps 4b and 5 | Task 1 (`test_the_job_timeout_exceeds_the_openai_and_meta_timeouts_together`, VS-004's lease test); Task 6 (`test_startup_warns_when_the_job_timeout_…`) |
 | One retry layer; `max_retries=0`; classification in one place (req. 3) | Task 2, Step 5 | Task 2 (`test_the_sdk_retry_budget_is_zero`, `test_one_attempt_per_call`, the classification tables, `test_only_the_openai_integration_imports_the_sdk`); Task 8 (`test_an_openai_outage_…`: five requests for five tries) |
 | `insufficient_quota` is permanent (req. 3) | Task 2, Step 5 | Task 2 (`test_no_credit_is_permanent_although_it_is_a_429`); Task 8 |
 | Fallback through the exactly-once path, plus a dead letter (req. 4) | Task 7, Step 3 | Task 7 (last-try, permanent, committed-together, crash, two-dead-letters tests); Task 9, Step 8 (live) |
@@ -1616,7 +1629,7 @@ If not: leave `PARTIAL`, and write down exactly which check failed and what the 
 | Hard rule 4: no tenant id to the model | Task 4 | Task 8 (`test_the_model_request_contains_no_ids_…`) |
 | Hard rule 5: never claims a booking | Task 4 (prompt) | Task 4 (prompt test); Task 9, checks 2, 6, 9, 10 |
 | Hard rule 10: no medical advice; emergency notice | Task 4 (prompt) | Task 4 (prompt tests); Task 9, checks 4 and 5 |
-| Hard rule 11: timeouts, bounded retries, dead letters | Tasks 1, 2, 7 | Tasks 1, 2, 7, 8 |
+| Hard rule 11: timeouts, bounded retries, dead letters | Tasks 1, 2, 6 (Step 4b: the Meta deadline), 7 | Tasks 1, 2, 6, 7, 8 |
 | `pytest` passes, `ruff check` clean | every task | Task 8, Step 2; Task 9, Step 9 |
 | Slice Status and Notes updated; `docs/slices/README.md` corrected | Task 1, Step 1; Task 8, Steps 5 and 7 | Task 9, Step 9 |
 | Each task reported, no mid-slice checkpoints | every task's last step | `.superpowers/sdd/VS-005-report.md` |

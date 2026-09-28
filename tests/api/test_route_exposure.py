@@ -101,3 +101,31 @@ def test_the_webhook_answers_both_methods_meta_uses():
 
     # GET is the one-time handshake, POST is every delivery. Nothing else.
     assert served["/webhooks/whatsapp"] == {"GET", "POST"}
+
+
+def test_the_webhook_imports_neither_the_agent_nor_openai():
+    """Hard rule 1, restated now that the repo contains something slow.
+
+    The webhook verifies, dedupes, stores, enqueues and returns 200. An import
+    of app.agent or app.integrations in app/api/ would be the first step
+    towards doing model work inside a request Meta is timing.
+    """
+    import ast
+    import pathlib
+
+    forbidden = ("app.agent", "app.integrations", "openai")
+    offenders: list[str] = []
+    for path in pathlib.Path("app/api").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            for name in names:
+                if any(name == bad or name.startswith(bad + ".") for bad in forbidden):
+                    offenders.append(f"{path.as_posix()}: {name}")
+
+    assert offenders == []

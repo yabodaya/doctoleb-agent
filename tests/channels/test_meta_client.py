@@ -280,3 +280,53 @@ def test_the_worker_package_contains_no_http_status_literals():
         if re.search(r"\bstatus_code\b|\b(4\d\d|5\d\d)\b", code):
             offenders.append(str(path))
     assert offenders == []
+
+
+async def test_a_slow_send_is_cut_off_at_the_wall_clock_deadline():
+    """VS-005 execution amendment A2, and the same flaw the OpenAI client has.
+
+    httpx's float timeout applies PER CONNECTION PHASE - connect, write, read
+    and pool each get the whole value - so one send can legitimately take
+    several times META_SEND_TIMEOUT_SECONDS. JOB_TIMEOUT_SECONDS is supposed to
+    cover OPENAI_TIMEOUT_SECONDS plus this one, and an arq job that exceeds its
+    timeout is finished as FAILED and never retried: none of our exit paths
+    run, so the event is stranded with no dead letter and a lease left to
+    expire. asyncio.timeout makes the budget real.
+
+    A MockTransport does not enforce httpx's own timeout, so the only thing
+    that can end this call is our deadline.
+    """
+    import asyncio
+    import time
+
+    recorder = Recorder(ok_body())
+
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1.0)
+        return recorder(request)
+
+    settings = make_settings(meta_send_timeout_seconds=0.05)
+    client = MetaClient(httpx.AsyncClient(transport=httpx.MockTransport(stall)), settings)
+    started = time.monotonic()
+
+    result = await client.send_text(PHONE_NUMBER_ID, phone(1), PATIENT_TEXT)
+
+    assert result.outcome is SendOutcome.RETRYABLE
+    assert result.reason == "http_timeout"
+    assert time.monotonic() - started < 0.9
+    # One attempt, cut off - never a second send of a message Meta may already
+    # have accepted.
+    assert len(recorder.requests) == 0
+
+
+def test_our_own_deadline_is_classified_as_a_retryable_timeout():
+    """The built-in TimeoutError asyncio.timeout raises is OURS, not httpx's.
+
+    Before amendment A2, classify_exception returned None for it, so the send
+    path would have re-raised it as if it were a bug in our own code - the one
+    thing the None return exists to let through.
+
+    Retryable, like every other timeout: Meta may have accepted the message, so
+    calling it permanent would trade a rare duplicate for a routine silent loss.
+    """
+    assert classify_exception(TimeoutError()) is SendOutcome.RETRYABLE

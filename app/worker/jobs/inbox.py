@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent import HistoryEntry, Turn, process_turn
 from app.channels.whatsapp.client import MetaClient, SendOutcome
 from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind, StatusUpdate
 from app.channels.whatsapp.redact import scrub
@@ -27,6 +28,7 @@ from app.db.enums import (
     MessageModality,
     MessageStatus,
 )
+from app.db.models import Message
 from app.db.repositories import (
     ContactRepository,
     ConversationRepository,
@@ -35,6 +37,7 @@ from app.db.repositories import (
     WebhookInboxRepository,
 )
 from app.db.repositories.errors import DuplicateRecordError
+from app.integrations.openai import ChatClient, ChatOutcome
 from app.tenants import TenantId, TenantMapError, TenantResolver, UnknownPhoneNumberError
 from app.worker.errors import PermanentJobError, RetryableJobError
 from app.worker.retrying import backoff_seconds
@@ -65,6 +68,13 @@ class EventContext:
     settings: Settings
     sessionmaker: async_sessionmaker[AsyncSession]
     meta: MetaClient
+    # VS-005. `chat` is the model behind its interface - never the SDK (hard
+    # rule 3). `job_try` is carried so the handler and the envelope cannot
+    # disagree about which try is the last one (plan assumption A7): the
+    # handler decides "fall back instead of retrying" with exactly the
+    # comparison the envelope uses to decide "dead-letter instead of deferring".
+    chat: ChatClient
+    job_try: int = 1
 
     @property
     def item(self) -> Any:
@@ -94,6 +104,7 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
     sessionmaker: async_sessionmaker[AsyncSession] = ctx["sessionmaker"]
     resolver: TenantResolver = ctx["resolver"]
     meta: MetaClient = ctx["meta"]
+    chat: ChatClient = ctx["chat"]
     event_id = uuid.UUID(row_id)
 
     kind: str | None = None
@@ -155,6 +166,8 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
             settings=settings,
             sessionmaker=sessionmaker,
             meta=meta,
+            chat=chat,
+            job_try=job_try,
         )
         outcome = await handler(context)
         logger.info("inbox event done event_id=%s kind=%s outcome=%s", event_id, kind, outcome)
@@ -298,12 +311,6 @@ async def _dead_letter(
         await session.commit()
 
 
-# The reply VS-004 sends. A constant, not a setting (plan assumption A4): it is
-# temporary by the slice's own words and VS-005 deletes it, so a knob here is a
-# knob nobody will ever turn on a value that is about to disappear.
-ACK_TEXT = "Received ✅"
-
-
 def _modality_for(message_type: str | None) -> MessageModality:
     """Meta's `type` -> our modality.
 
@@ -355,15 +362,62 @@ def _validated_message(item: Any) -> InboundMessage:
         raise PermanentJobError("unmodelled_message") from None
 
 
+def _history_entry(row: Message) -> HistoryEntry:
+    """One stored message, reduced to what the model needs.
+
+    Built inside T1 while the session is open, so no ORM object - and no lazy
+    load - ever crosses into the agent (hard rule 3, plan conflict C2).
+    """
+    return HistoryEntry(
+        direction=MessageDirection(row.direction),
+        modality=MessageModality(row.modality),
+        text=row.text,
+    )
+
+
+async def _drop(
+    session: AsyncSession,
+    context: EventContext,
+    inbound_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> str:
+    """Hard rule 7's exit, shared by both reads.
+
+    A reply row an earlier try reserved but never sent is marked FAILED rather
+    than left QUEUED (plan conflict C9): nobody will ever send it now, and a
+    QUEUED row would reach later prompts as something the clinic said. FAILED
+    is also hard rule 5's shape - nothing claims the patient was told it.
+
+    The inbox row is PROCESSED: the event was handled, correctly, by not
+    replying to it.
+    """
+    messages = MessageRepository(session, context.tenant_id)
+    reserved = await messages.get_reply_to(inbound_id)
+    if reserved is not None and not reserved.provider_message_id:
+        await messages.mark_failed(reserved.id)
+    await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+    await session.commit()
+    # Ids only, never the message (hard rule 7's own wording).
+    logger.info(
+        "reply dropped, conversation not AI-active event_id=%s conversation_id=%s",
+        context.event_id,
+        conversation_id,
+    )
+    return "dropped_not_ai_active"
+
+
 async def handle_message(context: EventContext) -> str:
-    """Store the inbound message, then answer it exactly once.
+    """Store the inbound message, then answer it exactly once - with the model's
+    reply (VS-005), generated with no transaction open.
 
-    Requirement 2: EVERY inbound type is stored; only the types in
-    WHATSAPP_REPLY_TO_TYPES get a reply. An image nobody answers is still a
-    message the clinic has to be able to see.
+    Requirement 2 of VS-004 still holds: EVERY inbound type is stored; only the
+    types in WHATSAPP_REPLY_TO_TYPES get a reply.
 
-    The order below is the correctness of the whole slice - see "Commit
-    boundaries" in docs/plans/VS-004-plan.md before changing it.
+    The order below is the correctness of the slice - see "Commit boundaries" in
+    docs/plans/VS-005-plan.md before moving anything. In short: T1 stores and
+    reads and is committed and CLOSED; the model runs outside any transaction;
+    T1b re-reads the state (hard rule 7) and reserves the reply WITH its text;
+    Meta is sent the STORED text; T2 records the wamid.
 
     Every log line uses event_id=<webhook_inbox row uuid> (plan note C2). The
     wamid is stored in messages.provider_message_id and never logged: it is
@@ -420,6 +474,7 @@ async def handle_message(context: EventContext) -> str:
             inbound = existing
 
         conversation_id = conversation.id
+        inbound_id = inbound.id
 
         if not reply_wanted:
             await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
@@ -431,9 +486,18 @@ async def handle_message(context: EventContext) -> str:
             )
             return "stored_no_reply"
 
-        # Hard rule 7, re-read from the DATABASE rather than trusted from the
-        # get-or-create above: a human may have taken this conversation over while
-        # the job was resolving a tenant or storing the message.
+        reserved = await messages.get_reply_to(inbound_id)
+        if reserved is not None and reserved.provider_message_id:
+            # A previous try already sent it. Requirement 3: do not send again.
+            await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
+            await session.commit()
+            logger.info("reply already sent event_id=%s", context.event_id)
+            return "already_replied"
+
+        # Hard rule 7, FIRST read. NOT the one that protects the send - that is
+        # in T1b, after the model. This one keeps a conversation a human already
+        # holds from costing a model call, and from sending the patient's words
+        # to OpenAI for nothing (plan conflict S4).
         #
         # current_state() selects the state COLUMN, not the entity, and that is
         # the whole point. A select() for a mapped Conversation in this session is
@@ -443,36 +507,90 @@ async def handle_message(context: EventContext) -> str:
         # only thing it exists to see.
         state = await conversations.current_state(conversation_id)
         if state is None or state not in _AI_STATES:
-            await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
-            await session.commit()
-            # Ids only, never the message (hard rule 7's own wording).
-            logger.info(
-                "reply dropped, conversation not AI-active event_id=%s conversation_id=%s",
-                context.event_id,
-                conversation_id,
-            )
-            return "dropped_not_ai_active"
+            return await _drop(session, context, inbound_id, conversation_id)
 
-        reply = await messages.reserve_reply(conversation_id, inbound.id, ACK_TEXT)
-        if reply.provider_message_id:
-            # A previous try already sent it. Requirement 3: do not send again.
+        turn: Turn | None = None
+        if reserved is None:
+            earlier = await messages.history_before(
+                conversation_id, inbound_id, context.settings.agent_history_messages
+            )
+            turn = Turn(
+                tenant_id=context.tenant_id,
+                contact_id=contact.id,
+                conversation_id=conversation_id,
+                modality=MessageModality(inbound.modality),
+                input_text=inbound.text,
+                history=tuple(_history_entry(row) for row in earlier),
+            )
+        await session.commit()
+    # The session is CLOSED. No transaction is open from here until T1b: the
+    # conversation row lock MessageRepository.add took (last_inbound_at) was
+    # released by that commit, so a staff member taking over never waits for
+    # OpenAI. Outside the block, not merely after the commit, so no stray query
+    # can open a transaction that then stays open across the call.
+
+    # --- generation: only when no reply row exists yet -----------------------
+    reply_text: str | None = None  # None: send the text an earlier try reserved
+    if turn is not None:
+        generated = await process_turn(turn, context.chat)
+        logger.info(
+            "reply generated event_id=%s outcome=%s reason=%s prompt_version=%s "
+            "history=%d prompt_tokens=%s completion_tokens=%s",
+            context.event_id,
+            generated.outcome.value,
+            generated.reason,
+            generated.prompt_version,
+            len(turn.history),
+            generated.prompt_tokens,
+            generated.completion_tokens,
+        )
+        # Temporary - Task 7 replaces both raises with the fallback.
+        if generated.outcome is ChatOutcome.RETRYABLE:
+            raise RetryableJobError(generated.reason)
+        if generated.outcome is ChatOutcome.PERMANENT:
+            raise PermanentJobError(generated.reason)
+        reply_text = generated.reply_text
+
+    # --- T1b -----------------------------------------------------------------
+    async with context.sessionmaker() as session:
+        conversations = ConversationRepository(session, context.tenant_id)
+        messages = MessageRepository(session, context.tenant_id)
+        # Hard rule 7, SECOND and authoritative read: after the model, in a new
+        # transaction, immediately before the reservation and the send. The model
+        # call is the longest thing the job does, so the check that protects the
+        # send has to come after it.
+        state = await conversations.current_state(conversation_id)
+        if state is None or state not in _AI_STATES:
+            return await _drop(session, context, inbound_id, conversation_id)
+
+        if reply_text is not None:
+            # WITH the text. Once a text is reserved, that text IS the reply:
+            # ON CONFLICT DO NOTHING returns whichever row the database kept,
+            # and it is that row's text that gets sent.
+            reply = await messages.reserve_reply(conversation_id, inbound_id, reply_text)
+        else:
+            reply = await messages.get_reply_to(inbound_id)
+            if reply is None:  # pragma: no cover - T1 saw it, and nothing deletes it
+                raise RetryableJobError("reply_row_vanished")
+
+        if reply.provider_message_id:  # pragma: no cover - the lease makes this unreachable
             await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
             await session.commit()
             logger.info("reply already sent event_id=%s", context.event_id)
             return "already_replied"
 
-        reply_id = reply.id
+        reply_id, text_to_send = reply.id, reply.text
         # COMMIT before touching Meta. A reply row written in the same
         # transaction as the wamid would leave no trace of an attempted send, and
         # the retry would have nothing to recognise.
         await session.commit()
 
-    # --- the one Meta call -------------------------------------------------
-    result = await context.meta.send_text(context.phone_number_id, wa_id, ACK_TEXT)
+    # --- the one Meta call: always the STORED text (requirement 2) ------------
+    result = await context.meta.send_text(context.phone_number_id, wa_id, text_to_send)
 
     if result.outcome is SendOutcome.RETRYABLE:
         # The reply row stays QUEUED with no wamid, so the next try recognises it
-        # and sends again. This is the window the duplicate-reply gap lives in.
+        # and sends its STORED text again - never a second model call.
         raise RetryableJobError(result.reason)
 
     if result.outcome is SendOutcome.PERMANENT:
