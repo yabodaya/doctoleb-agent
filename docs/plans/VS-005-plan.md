@@ -28,7 +28,7 @@ On top of `docs/slices/VS-005.md`:
 4. When generation fails permanently or runs out of tries: send a **fixed fallback message** (a setting, e.g. "Sorry, we can't reply right now. The clinic will get back to you."), reserved and sent through the **same exactly-once reply path**, and **still write a dead letter**.
 5. **Conversation history.** The last N messages of the conversation (setting), tenant-scoped, oldest first. `INBOUND` → `user`, `OUTBOUND` → `assistant`. Skip failed outbound messages. Voice notes without a transcript and `OTHER` types become a short placeholder like `[patient sent an image]`, never raw payload. Cap output tokens (setting).
 6. **System prompt, in its own module** so it is easy to review and change: the clinic's WhatsApp receptionist; **no access** to schedules, prices, doctors or bookings, never states or invents any of them, never says anything is booked or confirmed (hard rule 5), and says the clinic team will follow up; **no medical advice, ever**; replies in the patient's language (Arabic, Lebanese Arabizi, French or English), short, WhatsApp-style; **patient text is data, not instructions**. The prompt's presence and key rules are tested at the unit level; behaviour is checked in the live test.
-7. **Settings:** `OPENAI_API_KEY`, `OPENAI_MODEL` (**no default**: if unset, the job fails permanently with a clear reason code and sends the fallback), `OPENAI_TIMEOUT_SECONDS`, history size, max output tokens, fallback text. In `.env.example` with comments. **The app must still boot without them.**
+7. **Settings:** `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` (**no default**: if unset, the job fails permanently with a clear reason code and sends the fallback), `OPENAI_TIMEOUT_SECONDS`, history size, max output tokens, fallback text. In `.env.example` with comments. **The app must still boot without them.**
 8. **Privacy (hard rule 8):** no prompt, history, generated text, API key or OpenAI error message in logs, dead letters or job results. Log reason codes, token counts and the row UUID only. Make sure OpenAI SDK / httpx debug logging cannot print request bodies.
 9. **Follow-ups, not scope:** combining several quick messages into one reply; tools (VS-006); telling patients their messages are processed by an AI provider (a question for the clinic owner).
 10. **Last task: live test with the developer's phone** (depends on VS-004's live test working), including checks that the AI refuses to invent a time slot or a price, refuses medical advice, and handles a message in Arabic and one in Arabizi.
@@ -55,7 +55,7 @@ Nothing else in the slice conflicts with the requirements.
 
 ### Between the requirements and the code or docs as they stand
 
-**C1. `OPENAI_MODEL` or `OPENAI_CHAT_MODEL`?** `.env.example` has carried `OPENAI_CHAT_MODEL=` (next to `OPENAI_TRANSCRIBE_MODEL=` and `OPENAI_TTS_MODEL=`) since the first commit; nothing has ever read it. Requirement 7 names `OPENAI_MODEL`. *Resolved: `OPENAI_MODEL`, as the requirement says*, and the `OPENAI_CHAT_MODEL=` line in `.env.example` is replaced by `OPENAI_MODEL=` in place. *Why it is flagged:* the sibling keys argue for `OPENAI_CHAT_MODEL`, and a developer `.env` that already set `OPENAI_CHAT_MODEL` would be silently ignored — every reply would be the fallback with reason `openai_model_unset`, and the worker's startup warning (Task 6) would say `OPENAI_MODEL is not set`. Switching names is one line in `app/config.py` and one in `.env.example`; say so when reviewing the plan.
+**C1. `OPENAI_MODEL` or `OPENAI_CHAT_MODEL`?** `.env.example` has carried `OPENAI_CHAT_MODEL=` (next to `OPENAI_TRANSCRIBE_MODEL=` and `OPENAI_TTS_MODEL=`) since the first commit; nothing has ever read it. Requirement 7 names `OPENAI_MODEL`. ***Resolved by the developer when they reviewed this plan (execution amendment A1): `OPENAI_CHAT_MODEL`, the key that is already there.*** The `OPENAI_CHAT_MODEL=` line in `.env.example` stays exactly where it is, the `Settings` field is `openai_chat_model`, and the worker's startup warning (Task 6) says `OPENAI_CHAT_MODEL is not set`. *Why it went this way:* the sibling keys argue for it, and a developer `.env` that already set `OPENAI_CHAT_MODEL` would otherwise be silently ignored — every reply would be the fallback. **The reason code stays `openai_model_unset`**: it names the concept, not the key, it is what VS-008's and VS-009's model settings will reuse, and it is already written into dead letters, the README table and Task 9.
 
 **C2. `process_turn`'s documented signature has no history, and cannot own a transaction.** `docs/architecture.md` sketches `process_turn(tenant_id, contact_id, conversation_id, modality, input_text) -> AgentResult`. The slice needs the last N messages, and the session rule forbids a transaction during the model call. *Resolved:* `process_turn(turn: Turn, chat: ChatClient) -> AgentResult`, where `Turn` carries exactly the documented five fields **plus `history`**, loaded by the job inside T1 and passed in as plain data. `process_turn` does no database access at all, so it cannot hold a transaction open by construction, and it stays WhatsApp-agnostic, as the architecture requires. `AgentResult` carries the reply text and the outcome; the architecture's "tool calls made" and "whether handoff was requested" fields are added by VS-006 and VS-010, when something can populate them. `docs/architecture.md`'s contract block is updated in Task 8.
 
@@ -219,7 +219,7 @@ VS-004's message job had three commits: the claim, T1, T2. VS-005 has four, and 
 | What happened | Outcome | Reason code |
 |---|---|---|
 | `OPENAI_API_KEY` blank | PERMANENT, no request | `openai_api_key_unset` |
-| `OPENAI_MODEL` blank | PERMANENT, no request | `openai_model_unset` |
+| `OPENAI_CHAT_MODEL` blank | PERMANENT, no request | `openai_model_unset` |
 | our wall-clock deadline, or `APITimeoutError` | RETRYABLE | `openai_timeout` |
 | `APIConnectionError` | RETRYABLE | `openai_connection` |
 | 429 with `code` or `type` `insufficient_quota` | **PERMANENT** | `openai_insufficient_quota` |
@@ -372,7 +372,7 @@ Everything else stands on these. No behaviour yet.
 
 **Interfaces:**
 - `Settings.model_config` gains `env_ignore_empty=True`
-- New on `Settings`: `openai_api_key: str = ""`, `openai_model: str = ""`, `openai_timeout_seconds: float` (default 30.0, `> 0`), `openai_max_output_tokens: int` (default 1000, `> 0`), `agent_history_messages: int` (default 20, `>= 0`), `agent_fallback_reply: str` (requirement 4's sentence; blank means unset)
+- New on `Settings`: `openai_api_key: str = ""`, `openai_chat_model: str = ""`, `openai_timeout_seconds: float` (default 30.0, `> 0`), `openai_max_output_tokens: int` (default 1000, `> 0`), `agent_history_messages: int` (default 20, `>= 0`), `agent_fallback_reply: str` (requirement 4's sentence; blank means unset)
 
 **Expected tests after this task: 317** (158 → 168 passed with nothing running)**.**
 
@@ -399,8 +399,8 @@ Create `.superpowers/sdd/VS-005-report.md` with a title line if it does not exis
 
 In `tests/test_config.py`, reusing its `_base_settings()` helper. `_env_file=None` keeps the developer's `.env` out, but not their shell: every test that asserts a default first `monkeypatch.delenv`s the keys it reads, as the Meta tests already do — a developer with `OPENAI_API_KEY` exported for another project must not see these fail.
 
-- `test_the_openai_settings_default_to_unset_and_do_not_block_startup` — `openai_api_key == ""`, `openai_model == ""`, and `Settings` builds. Requirement 7; VS-003's A3 for the same reason.
-- `test_the_openai_model_has_no_default_in_code` — `Settings.model_fields["openai_model"].default == ""`, with a docstring citing `CLAUDE.md` ("model names come from env vars, never hardcoded") and requirement 7.
+- `test_the_openai_settings_default_to_unset_and_do_not_block_startup` — `openai_api_key == ""`, `openai_chat_model == ""`, and `Settings` builds. Requirement 7; VS-003's A3 for the same reason.
+- `test_the_openai_model_has_no_default_in_code` — `Settings.model_fields["openai_chat_model"].default == ""`, with a docstring citing `CLAUDE.md` ("model names come from env vars, never hardcoded") and requirement 7.
 - `test_the_agent_settings_have_the_documented_defaults` — 30.0, 1000, 20, and the fallback sentence exactly. Pinned so a change is a visible decision (A3).
 - `test_a_blank_fallback_reply_falls_back_to_the_default` — `_base_settings(agent_fallback_reply="")` gives the default. A blank fallback can only mean "unset": an empty message is not a reply.
 - `test_the_app_boots_from_a_verbatim_copy_of_env_example` — **C5, and the most important test in this task.** Delete from the environment every key named in `.env.example` (`monkeypatch.delenv`, so the process environment cannot mask the file), then `Settings(_env_file=Path(".env.example"))` must build, and `meta_send_timeout_seconds`, `job_max_tries`, `openai_timeout_seconds` and `agent_history_messages` must equal their field defaults. Run it before Step 5 and record in the report that it fails with a `ValidationError` naming VS-004's numeric keys — the trap was already there.
@@ -411,7 +411,7 @@ In `tests/test_config.py`, reusing its `_base_settings()` helper. `_env_file=Non
 And update two existing tests:
 
 - `test_the_job_timeout_exceeds_the_send_timeout` → rename to `test_the_job_timeout_exceeds_the_openai_and_meta_timeouts_together` and assert `job_timeout_seconds > openai_timeout_seconds + meta_send_timeout_seconds` on the defaults. Docstring: a job arq times out is finished as failed, not retried, and our `except` blocks never run — no dead letter, a lease left to expire, and nothing re-enqueues the event (verified in arq 0.28). The job now makes two network calls, so its budget must cover both.
-- `test_every_new_key_is_present_in_env_example` — add `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_OUTPUT_TOKENS`, `AGENT_HISTORY_MESSAGES`, `AGENT_FALLBACK_REPLY`.
+- `test_every_new_key_is_present_in_env_example` — add `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_OUTPUT_TOKENS`, `AGENT_HISTORY_MESSAGES`, `AGENT_FALLBACK_REPLY`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -465,7 +465,7 @@ After the job settings:
     openai_api_key: str = ""
     # No default, on purpose (CLAUDE.md: model names come from env vars, never
     # from code). Blank = permanent failure `openai_model_unset` + the fallback.
-    openai_model: str = ""
+    openai_chat_model: str = ""
     # Hard rule 11: one model call, enforced as a WALL-CLOCK deadline - the SDK's
     # own timeout applies per connection phase. job_timeout_seconds must exceed
     # this plus meta_send_timeout_seconds; tests/test_config.py pins it.
@@ -488,16 +488,16 @@ Add `agent_fallback_reply` to `_blank_means_unset`'s field list (a blank fallbac
 
 - [ ] **Step 6: Rewrite the OpenAI block of `.env.example`, and add the Agent block**
 
-The `OPENAI_CHAT_MODEL=` line becomes `OPENAI_MODEL=` in place (C1). `OPENAI_TRANSCRIBE_MODEL=` and `OPENAI_TTS_MODEL=` stay (VS-008, VS-009). Every other key stays exactly as it is.
+The `OPENAI_CHAT_MODEL=` line stays where it is and gains its comment (C1, amendment A1). `OPENAI_TRANSCRIBE_MODEL=` and `OPENAI_TTS_MODEL=` stay (VS-008, VS-009). Every other key stays exactly as it is.
 
 ```bash
 # OpenAI (VS-005: AI replies). The worker sends the patient's recent messages
-# to OpenAI to write each reply. With OPENAI_API_KEY or OPENAI_MODEL blank,
+# to OpenAI to write each reply. With OPENAI_API_KEY or OPENAI_CHAT_MODEL blank,
 # nothing is sent: every reply is AGENT_FALLBACK_REPLY, and a dead letter says why.
 OPENAI_API_KEY=
 # The chat model. No default on purpose: model names come from here, never from
 # code. Blank = every reply is the fallback, reason openai_model_unset.
-OPENAI_MODEL=
+OPENAI_CHAT_MODEL=
 # One model call, in seconds, as a hard wall-clock deadline. Default 30.
 # JOB_TIMEOUT_SECONDS must stay ABOVE this plus META_SEND_TIMEOUT_SECONDS.
 OPENAI_TIMEOUT_SECONDS=
@@ -610,7 +610,7 @@ class FakeChatClient:
 
 - [ ] **Step 2: Write the failing client tests**
 
-All through `httpx2.MockTransport`, with `openai_api_key="sk-test-not-a-real-one"` and `openai_model="test-model"`. A helper builds a real completion body and an error body `{"error": {"message": …, "type": …, "param": None, "code": …}}`, and a recording transport counts requests the way `Meta` does.
+All through `httpx2.MockTransport`, with `openai_api_key="sk-test-not-a-real-one"` and `openai_chat_model="test-model"`. A helper builds a real completion body and an error body `{"error": {"message": …, "type": …, "param": None, "code": …}}`, and a recording transport counts requests the way `Meta` does.
 
 - `test_a_successful_completion_returns_the_text_and_the_token_counts`
 - `test_the_request_carries_the_model_the_messages_the_output_cap_and_store_false` — parse the recorded request's JSON: `model`, `messages` in order with their roles, `max_completion_tokens == settings.openai_max_output_tokens`, `store is False`, and the path ends `/chat/completions`.
@@ -712,7 +712,7 @@ class OpenAIChatClient:
     """ChatClient over the OpenAI SDK. One per worker process (plan assumption A9)."""
 
     def __init__(self, settings: Settings, http_client: httpx2.AsyncClient | None = None):
-        self._model = settings.openai_model.strip()
+        self._model = settings.openai_chat_model.strip()
         self._max_output_tokens = settings.openai_max_output_tokens
         self._deadline = settings.openai_timeout_seconds
         # Not built without a key: the SDK raises "Missing credentials" for an
@@ -1263,7 +1263,7 @@ def startup_warnings(settings: Settings) -> list[str]:
     """
 ```
 
-The three messages: `OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY`, `OPENAI_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY`, and `JOB_TIMEOUT_SECONDS=<n> does not exceed OPENAI_TIMEOUT_SECONDS=<n> + META_SEND_TIMEOUT_SECONDS=<n>: a slow reply can be cut off mid-send`.
+The three messages: `OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY`, `OPENAI_CHAT_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY`, and `JOB_TIMEOUT_SECONDS=<n> does not exceed OPENAI_TIMEOUT_SECONDS=<n> + META_SEND_TIMEOUT_SECONDS=<n>: a slow reply can be cut off mid-send`.
 
 - [ ] **Step 6: Run the tests, lint, format**
 
@@ -1291,7 +1291,7 @@ The three messages: `OPENAI_API_KEY is not set: every reply will be AGENT_FALLBA
 - `test_the_next_try_after_a_generation_failure_generates_again` — fake: retryable, then ok. Second run `replied`; two model calls; one reply row.
 - `test_a_retryable_generation_failure_on_the_last_try_sends_the_fallback` — `job_try == job_max_tries`: outcome `replied_fallback`; reply row text is `agent_fallback_reply`, `SENT` with a wamid; one dead letter with the fake's reason and `attempts == job_try`; inbox row `PROCESSED`.
 - `test_a_permanent_generation_failure_sends_the_fallback_on_the_first_try` — `openai_insufficient_quota` on try 1: `replied_fallback`, one dead letter, one model call.
-- `test_an_unset_model_sends_the_fallback_without_calling_openai` — the **real** `OpenAIChatClient` with `openai_model=""`, a key set, and a recording `httpx2.MockTransport`: zero OpenAI requests, `replied_fallback`, dead letter `openai_model_unset`. Requirement 7, end to end.
+- `test_an_unset_model_sends_the_fallback_without_calling_openai` — the **real** `OpenAIChatClient` with `openai_chat_model=""`, a key set, and a recording `httpx2.MockTransport`: zero OpenAI requests, `replied_fallback`, dead letter `openai_model_unset`. Requirement 7, end to end.
 - `test_the_fallback_and_its_dead_letter_are_committed_together_before_the_send` — the Meta hook reads, through an independent session, a `QUEUED` reply row holding the fallback text **and** the dead letter.
 - `test_a_crash_after_the_fallback_is_reserved_neither_loses_nor_repeats_its_dead_letter` — the first Meta call raises a plain `RuntimeError` (a crash mid-send); the job raises. Clear the lease as VS-004's tests do, run again: the stored fallback is sent, the model was called once in total, and there is exactly **one** dead letter.
 - `test_a_retried_fallback_send_does_not_call_the_model_or_write_a_second_dead_letter` — Meta 500 then 200 across two tries.
@@ -1413,7 +1413,7 @@ In "The worker, and what happens to a message": add `replied_fallback` to the ou
 |---|---|
 | `replied_fallback` + `openai_insufficient_quota` | the OpenAI account has no credit. Permanent: every reply falls back until it is topped up. |
 | `replied_fallback` + `openai_model_unset` / `openai_api_key_unset` | the setting is blank in `.env`. The worker's startup log says so too. |
-| `replied_fallback` + `openai_http_404_…` | `OPENAI_MODEL` names a model this key cannot use. |
+| `replied_fallback` + `openai_http_404_…` | `OPENAI_CHAT_MODEL` names a model this key cannot use. |
 | `replied_fallback` + `openai_http_401_…` | `OPENAI_API_KEY` is wrong or revoked. |
 | `replied_fallback` + `openai_reply_truncated` / `openai_empty_reply` | `OPENAI_MAX_OUTPUT_TOKENS` is too small for the model — likely a reasoning model spending the budget on hidden reasoning. |
 | `retrying … reason=openai_http_429` or `openai_timeout` | OpenAI is rate-limiting or slow. Retried with backoff; the fifth failure falls back. |
@@ -1482,7 +1482,7 @@ This task depends on Meta delivering real messages to the callback. If VS-004's 
 
 - [ ] **Step 1: Fill in the OpenAI settings**
 
-In `.env`: `OPENAI_API_KEY` (platform.openai.com → API keys; a project key), `OPENAI_MODEL` (a small, fast chat model your project can use — check the dashboard's model list; the plan names none, because model names change faster than plans), and confirm the account has credit. Leave `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_OUTPUT_TOKENS`, `AGENT_HISTORY_MESSAGES` and `AGENT_FALLBACK_REPLY` blank for their defaults. **Never** paste the key into a command, a note or a chat.
+In `.env`: `OPENAI_API_KEY` (platform.openai.com → API keys; a project key), `OPENAI_CHAT_MODEL` (a small, fast chat model your project can use — check the dashboard's model list; the plan names none, because model names change faster than plans), and confirm the account has credit. Leave `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_OUTPUT_TOKENS`, `AGENT_HISTORY_MESSAGES` and `AGENT_FALLBACK_REPLY` blank for their defaults. **Never** paste the key into a command, a note or a chat.
 
 ```powershell
 git switch feat/vs-005-ai-replies
@@ -1563,7 +1563,7 @@ Expected: every inbound message has exactly one `OUTBOUND` reply with a wamid, e
 
 - [ ] **Step 8: The fallback, once, on purpose**
 
-Set `OPENAI_MODEL=vs005-not-a-real-model` in `.env`, then `docker compose up -d --force-recreate worker`, and send `Hello again`.
+Set `OPENAI_CHAT_MODEL=vs005-not-a-real-model` in `.env`, then `docker compose up -d --force-recreate worker`, and send `Hello again`.
 
 ```powershell
 docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select job_name, source_event_id, error, attempts, created_at from dead_letter_jobs order by created_at desc limit 5;"
@@ -1605,7 +1605,7 @@ If not: leave `PARTIAL`, and write down exactly which check failed and what the 
 | Output tokens capped (req. 5) | Task 1, Task 2 | Task 2 (`test_the_request_carries_…_the_output_cap_…`) |
 | System prompt in its own versioned module, key rules tested (req. 6, slice) | Task 4, Step 4 | Task 4 (`test_prompts.py`, including the version pin) |
 | Settings, `.env.example`, boots without them (req. 7) | Task 1 | Task 1 (`test_the_app_boots_from_a_verbatim_copy_of_env_example` + 9) |
-| `OPENAI_MODEL` unset → permanent with a clear code + fallback (req. 7) | Tasks 2 and 7 | Task 2 (`test_an_unset_model_…`); Task 7 (`test_an_unset_model_sends_the_fallback_…`) |
+| `OPENAI_CHAT_MODEL` unset → permanent with a clear code + fallback (req. 7) | Tasks 2 and 7 | Task 2 (`test_an_unset_model_…`); Task 7 (`test_an_unset_model_sends_the_fallback_…`) |
 | No prompt, history, reply, key or OpenAI error text in logs, dead letters or job results (req. 8) | Tasks 2, 3, 6, 7 | Task 2 (`test_no_reason_carries_…`, reprs); Task 3 (DEBUG run); Task 6 (log-line tests); Task 7 (dead-letter payload); Task 8 (`test_nothing_sensitive_…`); Task 9, Step 5 (live) |
 | SDK / httpx debug logging cannot print request bodies (req. 8) | Task 3 | Task 3 (all four tests) |
 | Follow-ups recorded (req. 9) | Task 8, Step 5 | `docs/slices/VS-005.md` |
