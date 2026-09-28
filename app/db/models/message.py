@@ -21,6 +21,13 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         check_constraint("direction", MessageDirection, "direction_valid"),
         check_constraint("modality", MessageModality, "modality_valid"),
         check_constraint("status", MessageStatus, "status_valid"),
+        # One reply per inbound message, decided by the database (VS-004
+        # requirement 3). Nullable AND unique is exactly right here: PostgreSQL
+        # permits many NULLs under a unique constraint, so every inbound row and
+        # every non-reply outbound row is unaffected, while two jobs cannot both
+        # create a reply to the same message. This is what makes a retried job
+        # safe without the job checking first.
+        sa.UniqueConstraint("reply_to_message_id", name="uq_messages_reply_to_message_id"),
         # VS-005 reads the last N messages of a conversation on every turn.
         sa.Index(
             "ix_messages_tenant_id_conversation_id_created_at",
@@ -50,3 +57,8 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     text: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     status: Mapped[str] = mapped_column(sa.String(16), nullable=False)
     sent_at: Mapped[Any | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    # The inbound message this outbound message answers. NULL on every inbound
+    # row, and on any outbound message that is not a reply.
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=True
+    )

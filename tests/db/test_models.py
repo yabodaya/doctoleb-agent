@@ -136,3 +136,34 @@ def test_no_model_repr_leaks_content():
         rendered = repr(model(**kwargs))
         for value in kwargs.values():
             assert value not in rendered, f"{model.__name__} leaked {value!r}"
+
+
+def test_the_reply_link_points_at_a_message():
+    """The self-FK, asserted in metadata so it cannot quietly become a loose UUID.
+
+    A plain UUID column would let a reply point at a message that no longer
+    exists, and VS-004's "has this already been answered?" check would then
+    silently answer no.
+    """
+    column = Message.__table__.c.reply_to_message_id
+    assert column.nullable is True
+    targets = {fk.column for fk in column.foreign_keys}
+    assert targets == {Message.__table__.c.id}
+    assert all(fk.ondelete == "CASCADE" for fk in column.foreign_keys)
+
+
+def test_status_rank_covers_every_message_status():
+    """A new MessageStatus without a rank would silently rank 0.
+
+    Rank 0 means "anything can overwrite it", so a forgotten entry here turns
+    the forward-only guarantee off for that status instead of failing loudly.
+    """
+    from app.db.enums import STATUS_RANK, MessageStatus
+
+    assert set(STATUS_RANK) == set(MessageStatus)
+    # And the ordering VS-004 requirement 5 depends on.
+    assert STATUS_RANK[MessageStatus.SENT] < STATUS_RANK[MessageStatus.DELIVERED]
+    assert STATUS_RANK[MessageStatus.DELIVERED] < STATUS_RANK[MessageStatus.READ]
+    # FAILED overwrites SENT but never DELIVERED: a delivered message did not fail.
+    assert STATUS_RANK[MessageStatus.SENT] < STATUS_RANK[MessageStatus.FAILED]
+    assert STATUS_RANK[MessageStatus.FAILED] < STATUS_RANK[MessageStatus.DELIVERED]

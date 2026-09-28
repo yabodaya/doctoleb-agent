@@ -146,3 +146,60 @@ Swagger UI locally, and do not run a tunnel while it is on.
 `/health` and `/health/ready` stay reachable; they report dependency status and no
 credentials. Treat the tunnel URL as private, and stop the tunnel when you are not
 testing.
+
+## The worker, and what happens to a message
+
+The webhook does not answer anything. It verifies, deduplicates, stores and
+enqueues, and `arq` picks the job up in a separate process — that is hard rule 1,
+and it is why the api stays fast when Meta is slow.
+
+```powershell
+docker compose up            # api, worker, postgres, redis
+docker compose logs -f worker | Select-String "inbox event"
+```
+
+One line per job. `event_id` is the `webhook_inbox` row id, and every outcome is
+one of: `replied`, `sent_without_id`, `stored_no_reply`, `dropped_not_ai_active`,
+`already_replied`, `status_advanced`, `status_not_moved`, `status_ignored`,
+`skipped`, `dead_lettered`.
+
+### Reading the tables
+
+**Take the database credentials from `docker-compose.yml` and `.env`** rather than
+copying them from here — compose defaults `POSTGRES_USER` and `POSTGRES_DB`, and a
+changed `.env` makes every command below fail with an authentication error that
+looks like something else:
+
+```powershell
+Select-String -Path docker-compose.yml, .env -Pattern "POSTGRES_USER|POSTGRES_DB"
+```
+
+Then, substituting those values:
+
+```powershell
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select id, status, attempts, locked_until is null as free, tenant_id is not null as has_tenant, created_at from webhook_inbox order by created_at desc limit 10;"
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select direction, modality, status, provider_message_id is not null as has_wamid, reply_to_message_id is not null as is_reply from messages order by created_at desc limit 10;"
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select job_name, source_event_id, error, attempts, created_at from dead_letter_jobs order by created_at desc limit 10;"
+```
+
+**Select ids, statuses and reason codes. Never `payload`, never `text`, and never
+`provider_event_id`** (hard rule 8). A terminal transcript is as public as a log:
+`payload` and `text` hold the patient's words, and a `provider_event_id` is a
+`wamid`, which is base64 and commonly decodes to include their phone number.
+
+`free` in the first query is the claim lease. `false` on a row that nothing is
+working on means a worker died holding it; it becomes claimable again by itself
+once the lease expires (`JOB_TIMEOUT_SECONDS + JOB_LEASE_MARGIN_SECONDS`).
+
+### When a reply does not arrive
+
+| What you see | What it means |
+|---|---|
+| no `inbox event` line at all | the job was never enqueued, or the worker is not running. Check the api log for `enqueue failed`. |
+| `dead_lettered` with `unknown_phone_number` | the number is not in `WHATSAPP_TENANT_MAP`, and there is no default tenant (hard rule 4). |
+| `dead_lettered` with `http_401` | `META_ACCESS_TOKEN` is wrong or expired. Permanent, so it dead-letters on the first try rather than after five. |
+| `dead_lettered` with `http_400 code_131030` | the recipient is not on the test number's allowed list. |
+| `retrying … reason=http_500` | Meta's problem. Deferrals are 5s, 10s, 20s, 40s, then a dead letter. |
+| `stored_no_reply` | the message was stored but its type is not in `WHATSAPP_REPLY_TO_TYPES` (default: `text` only). |
+| `dropped_not_ai_active` | a human holds the conversation, or it is closed (hard rule 7). |
+| `status_before_wamid` in a dead letter | a delivery status for a message this tenant never sent — often a message sent by hand from the Meta Business app. |

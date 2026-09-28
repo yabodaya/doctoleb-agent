@@ -100,3 +100,19 @@ def test_models_and_migrations_do_not_drift(migrated_database: str):
         return compare_metadata(context, Base.metadata)
 
     assert asyncio.run(_diff()) == []
+
+
+def test_one_step_downgrade_and_upgrade_is_repeatable(lifecycle_url: str):
+    """VS-004's migration, specifically: head -> -1 -> head.
+
+    The base-to-head round trip above would still pass if the newest revision's
+    downgrade dropped a table its upgrade never created, because everything is
+    dropped by the end anyway. Stepping back exactly one revision and forward
+    again is what proves THIS revision reverses itself - the CHECK swap
+    included, which nothing else in this suite can see.
+    """
+    config = alembic_config(lifecycle_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-1")
+    command.upgrade(config, "head")
+    assert _table_names(lifecycle_url) == EXPECTED_TABLES

@@ -38,3 +38,15 @@ class WebhookInbox(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # excerpt: that would copy patient text out of `payload` into a column that
     # gets read casually.
     last_error: Mapped[str | None] = mapped_column(sa.String(500), nullable=True)
+    # A worker's time-limited claim on this row (VS-004 plan note C3a).
+    #
+    # `status` alone cannot serialise two concurrent runs of one event. It must
+    # let a PROCESSING row be reclaimed - a try that died between the job's two
+    # commits left it PROCESSING, and refusing that row would mean the patient's
+    # message is never answered - so PROCESSING cannot also mean "someone is
+    # working on it right now". The only thing separating a dead try from a live
+    # one is time, which is what this column holds.
+    #
+    # Set to now() + job_timeout + margin by claim(), always by PostgreSQL's
+    # clock, and cleared on every exit from the job.
+    locked_until: Mapped[Any | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)

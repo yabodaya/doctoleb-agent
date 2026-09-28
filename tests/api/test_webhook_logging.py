@@ -9,7 +9,9 @@ that carries the statement's parameters.
 import logging
 
 import pytest
+import sqlalchemy as sa
 
+from app.db.models import WebhookInbox
 from tests.whatsapp_factories import (
     PATIENT_TEXT,
     PROFILE_NAME,
@@ -63,8 +65,15 @@ async def test_a_stored_webhook_logs_event_ids_and_never_content(
 ):
     """Hard rule 8 on the path that actually carries a patient's words.
 
-    Logging the ids is the point - without them a production incident has nothing
-    to correlate. Logging the body is the violation.
+    Logging an id is the point - without one a production incident has nothing to
+    correlate. Logging the body is the violation.
+
+    The id is our webhook_inbox ROW id, not the provider_event_id. VS-003 logged
+    the latter, reasoning that a wamid is an opaque Meta identifier; VS-004 found
+    that wrong - a wamid is base64 and commonly decodes to include the patient's
+    phone number, and a status event id carries the wamid of the message we sent
+    TO the patient. So a wamid is asserted ABSENT here, where it used to be
+    asserted present.
     """
     raw, headers = signed(envelope(messages=[text_message(1)], statuses=[status_update(2, "read")]))
 
@@ -72,6 +81,16 @@ async def test_a_stored_webhook_logs_event_ids_and_never_content(
         response = await client.post(PATH, content=raw, headers=headers)
 
     assert response.status_code == 200
-    assert f"msg:{wamid(1)}" in caplog.text
-    assert f"status:{wamid(2)}:read" in caplog.text
+
+    row_ids = [
+        str(row_id) for row_id in (await use_database.scalars(sa.select(WebhookInbox.id))).all()
+    ]
+    assert len(row_ids) == 2
+    for row_id in row_ids:
+        assert row_id in caplog.text
+
+    assert wamid(1) not in caplog.text
+    assert wamid(2) not in caplog.text
+    assert "msg:" not in caplog.text
+    assert "status:" not in caplog.text
     assert_no_patient_content(caplog)
