@@ -5,6 +5,7 @@ import uuid
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.db.enums import (
     STATUS_RANK,
@@ -88,6 +89,52 @@ class MessageRepository(TenantScopedRepository):
             .where(
                 Message.tenant_id == self.tenant_id,
                 Message.conversation_id == conversation_id,
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(limit)
+        )
+        return list(reversed(result.all()))
+
+    async def history_before(
+        self, conversation_id: uuid.UUID, message_id: uuid.UUID, limit: int
+    ) -> list[Message]:
+        """The `limit` newest messages of a conversation created before one
+        message, oldest first - what the model sees before the message it is
+        answering (VS-005 plan assumption A8).
+
+        Anchored on the answered message's created_at IN SQL, through its id,
+        rather than on the ORM attribute: after an INSERT the server-default
+        created_at may not be loaded, and loading it under AsyncSession raises
+        MissingGreenlet.
+
+        Failed outbound messages are skipped here, not in Python, so `limit`
+        counts only what the model will see (requirement 5). Without that, a
+        conversation with a run of failed replies would reach the model with
+        almost no memory at all.
+
+        Served by ix_messages_tenant_id_conversation_id_created_at, which
+        VS-002 added for this query.
+        """
+        if limit <= 0:
+            return []
+        anchor = aliased(Message)
+        anchor_created_at = (
+            sa.select(anchor.created_at)
+            .where(anchor.id == message_id, anchor.tenant_id == self.tenant_id)
+            .scalar_subquery()
+        )
+        result = await self._session.scalars(
+            sa.select(Message)
+            .where(
+                Message.tenant_id == self.tenant_id,
+                Message.conversation_id == conversation_id,
+                Message.created_at < anchor_created_at,
+                sa.not_(
+                    sa.and_(
+                        Message.direction == MessageDirection.OUTBOUND.value,
+                        Message.status == MessageStatus.FAILED.value,
+                    )
+                ),
             )
             .order_by(Message.created_at.desc(), Message.id.desc())
             .limit(limit)

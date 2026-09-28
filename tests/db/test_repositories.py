@@ -712,3 +712,184 @@ async def test_advancing_a_status_for_another_tenant_changes_nothing(db_session)
 
     stored = await messages.get_by_provider_id(f.wamid(2))
     assert stored.status == MessageStatus.SENT.value
+
+
+# --- history_before: what VS-005 sends the model ----------------------------
+#
+# created_at is set explicitly on every row. PostgreSQL's now() is the
+# TRANSACTION start time, so rows written in one test would otherwise share one
+# timestamp and the ordering these tests are about would be undefined.
+
+
+async def _conversation_with_history(session, tenant=f.TENANT_A, texts=("a", "b", "c", "d")):
+    """A conversation with `texts` as inbound messages, one minute apart."""
+    contact = f.make_contact(tenant)
+    session.add(contact)
+    await session.flush()
+    conversation = f.make_conversation(contact)
+    session.add(conversation)
+    await session.flush()
+    rows = []
+    for index, text in enumerate(texts):
+        message = f.make_message(conversation, text=text, provider_message_id=f.wamid(index + 1))
+        message.created_at = f.LONG_AGO + dt.timedelta(minutes=index)
+        session.add(message)
+        rows.append(message)
+    await session.flush()
+    return conversation, rows
+
+
+async def test_history_is_the_newest_messages_before_the_given_one_oldest_first(db_session):
+    """Oldest first, because that is the order a chat model reads."""
+    conversation, rows = await _conversation_with_history(
+        db_session, texts=("one", "two", "three", "four", "five")
+    )
+    messages = MessageRepository(db_session, f.TENANT_A)
+
+    history = await messages.history_before(conversation.id, rows[-1].id, limit=3)
+
+    assert [m.text for m in history] == ["two", "three", "four"]
+
+
+async def test_history_excludes_the_message_being_answered_and_anything_after_it(db_session):
+    """Plan assumption A8.
+
+    Two messages a second apart produce two jobs, and the job answering the
+    FIRST can find the second already stored. Without the cut, its prompt would
+    put the later message before the one it is answering - the model would be
+    asked to reply to a question it had already been shown the sequel to.
+    """
+    conversation, rows = await _conversation_with_history(
+        db_session, texts=("first", "answered", "arrived later")
+    )
+    messages = MessageRepository(db_session, f.TENANT_A)
+
+    history = await messages.history_before(conversation.id, rows[1].id, limit=20)
+
+    assert [m.text for m in history] == ["first"]
+
+
+async def test_history_skips_failed_outbound_messages(db_session):
+    """Requirement 5: a reply that never reached the patient is not something
+    the clinic said.
+
+    Every other outbound status stays: QUEUED (reserved, in flight), SENT,
+    DELIVERED and READ are all things the patient has been or is about to be
+    told. Inbound rows are never filtered - a FAILED inbound cannot happen, and
+    if one ever did it would still be something the patient wrote.
+    """
+    conversation, rows = await _conversation_with_history(db_session, texts=("hello",))
+    messages = MessageRepository(db_session, f.TENANT_A)
+    statuses = [
+        MessageStatus.FAILED,
+        MessageStatus.QUEUED,
+        MessageStatus.SENT,
+        MessageStatus.DELIVERED,
+        MessageStatus.READ,
+    ]
+    for index, status in enumerate(statuses):
+        reply = f.make_message(
+            conversation,
+            direction=MessageDirection.OUTBOUND.value,
+            status=status.value,
+            text=f"outbound {status.value}",
+        )
+        reply.created_at = f.LONG_AGO + dt.timedelta(minutes=10 + index)
+        db_session.add(reply)
+    anchor = f.make_message(conversation, text="the new one", provider_message_id=f.wamid(90))
+    anchor.created_at = f.LONG_AGO + dt.timedelta(minutes=30)
+    db_session.add(anchor)
+    await db_session.flush()
+
+    history = await messages.history_before(conversation.id, anchor.id, limit=20)
+
+    assert [m.text for m in history] == [
+        "hello",
+        "outbound QUEUED",
+        "outbound SENT",
+        "outbound DELIVERED",
+        "outbound READ",
+    ]
+
+
+async def test_the_limit_counts_only_messages_it_returns(db_session):
+    """Why the filter is in SQL and not in Python.
+
+    AGENT_HISTORY_MESSAGES is a promise about what the model SEES. Fetching N
+    rows and then dropping the failed ones would make a conversation with a run
+    of failed replies arrive at the model with almost no memory at all.
+    """
+    conversation, _ = await _conversation_with_history(db_session, texts=("keep 1", "keep 2"))
+    messages = MessageRepository(db_session, f.TENANT_A)
+    for index in range(4):
+        failed = f.make_message(
+            conversation,
+            direction=MessageDirection.OUTBOUND.value,
+            status=MessageStatus.FAILED.value,
+            text=f"failed {index}",
+        )
+        failed.created_at = f.LONG_AGO + dt.timedelta(minutes=5 + index)
+        db_session.add(failed)
+    keeper = f.make_message(conversation, text="keep 3")
+    keeper.created_at = f.LONG_AGO + dt.timedelta(minutes=20)
+    db_session.add(keeper)
+    anchor = f.make_message(conversation, text="the new one", provider_message_id=f.wamid(91))
+    anchor.created_at = f.LONG_AGO + dt.timedelta(minutes=30)
+    db_session.add(anchor)
+    await db_session.flush()
+
+    history = await messages.history_before(conversation.id, anchor.id, limit=3)
+
+    assert [m.text for m in history] == ["keep 1", "keep 2", "keep 3"]
+
+
+async def test_history_is_tenant_scoped(db_session):
+    """Hard rule 4. Another clinic's messages are not context, they are a leak."""
+    conversation, rows = await _conversation_with_history(db_session, texts=("mine", "answered"))
+
+    history = await MessageRepository(db_session, f.TENANT_B).history_before(
+        conversation.id, rows[1].id, limit=20
+    )
+
+    assert history == []
+
+
+async def test_history_is_scoped_to_one_conversation(db_session):
+    """A new conversation after a CLOSED one starts with no memory of it.
+
+    That is deliberate: CLOSED means the clinic considered the thread finished,
+    and carrying it forward would have the AI answer a new question from an old
+    context.
+    """
+    contact = f.make_contact(f.TENANT_A)
+    db_session.add(contact)
+    await db_session.flush()
+    closed = f.make_conversation(contact, state=ConversationState.CLOSED.value)
+    db_session.add(closed)
+    current = f.make_conversation(contact)
+    db_session.add(current)
+    await db_session.flush()
+    old = f.make_message(closed, text="from the closed thread")
+    old.created_at = f.LONG_AGO
+    db_session.add(old)
+    anchor = f.make_message(current, text="the new one", provider_message_id=f.wamid(92))
+    anchor.created_at = f.LONG_AGO + dt.timedelta(minutes=5)
+    db_session.add(anchor)
+    await db_session.flush()
+
+    history = await MessageRepository(db_session, f.TENANT_A).history_before(
+        current.id, anchor.id, limit=20
+    )
+
+    assert history == []
+
+
+async def test_a_limit_of_zero_returns_nothing_without_a_query(db_session):
+    """AGENT_HISTORY_MESSAGES=0 is a supported setting: reply to each message
+    on its own. LIMIT 0 would work; a negative limit is a SQL error, and both
+    are answered here before any statement is built."""
+    conversation, rows = await _conversation_with_history(db_session, texts=("a", "b"))
+    messages = MessageRepository(db_session, f.TENANT_A)
+
+    assert await messages.history_before(conversation.id, rows[1].id, limit=0) == []
+    assert await messages.history_before(conversation.id, rows[1].id, limit=-1) == []
