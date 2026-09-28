@@ -375,11 +375,49 @@ def _history_entry(row: Message) -> HistoryEntry:
     )
 
 
+async def _record_generation_failure(
+    session: AsyncSession, context: EventContext, reason: str
+) -> None:
+    """Requirement 4: the fallback is sent, and the failure is still recorded.
+
+    Written in the SAME transaction as the fallback's reservation (or the drop),
+    so both facts commit together or not at all: a crash after that commit
+    re-sends the stored fallback and finds this row already written; a crash
+    before it regenerates, and nothing was recorded. See "Commit boundaries" in
+    docs/plans/VS-005-plan.md.
+
+    VS-004's reference envelope (its plan note C7): codes and ids, never text.
+    The inbox row is NOT marked FAILED - the patient WAS answered, with the
+    fallback (VS-005 plan conflict C7). FAILED would also make the event
+    claimable again, which is the wrong signal for an event that was answered.
+    """
+    logger.error(
+        "reply generation failed event_id=%s reason=%s attempts=%d",
+        context.event_id,
+        reason,
+        context.job_try,
+    )
+    await DeadLetterJobRepository(session).add(
+        job_name=JOB_NAME,
+        payload=dead_letter_payload(
+            context.event_id,
+            InboxItemKind.MESSAGE.value,
+            context.phone_number_id,
+            context.job_try,
+        ),
+        error=reason,
+        attempts=context.job_try,
+        tenant_id=context.tenant_id,
+        source_event_id=str(context.event_id),
+    )
+
+
 async def _drop(
     session: AsyncSession,
     context: EventContext,
     inbound_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    failure: str | None = None,
 ) -> str:
     """Hard rule 7's exit, shared by both reads.
 
@@ -388,6 +426,10 @@ async def _drop(
     QUEUED row would reach later prompts as something the clinic said. FAILED
     is also hard rule 5's shape - nothing claims the patient was told it.
 
+    `failure` is a generation that had already failed when the takeover was
+    found. It is still recorded: it still happened, and somebody still has to
+    fix it. The patient simply gets a human instead of the fallback.
+
     The inbox row is PROCESSED: the event was handled, correctly, by not
     replying to it.
     """
@@ -395,6 +437,8 @@ async def _drop(
     reserved = await messages.get_reply_to(inbound_id)
     if reserved is not None and not reserved.provider_message_id:
         await messages.mark_failed(reserved.id)
+    if failure is not None:
+        await _record_generation_failure(session, context, failure)
     await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
     await session.commit()
     # Ids only, never the message (hard rule 7's own wording).
@@ -531,6 +575,7 @@ async def handle_message(context: EventContext) -> str:
 
     # --- generation: only when no reply row exists yet -----------------------
     reply_text: str | None = None  # None: send the text an earlier try reserved
+    failure: str | None = None  # set: the fallback is the reply, and a dead letter is owed
     if turn is not None:
         generated = await process_turn(turn, context.chat)
         logger.info(
@@ -544,12 +589,20 @@ async def handle_message(context: EventContext) -> str:
             generated.prompt_tokens,
             generated.completion_tokens,
         )
-        # Temporary - Task 7 replaces both raises with the fallback.
-        if generated.outcome is ChatOutcome.RETRYABLE:
+        if generated.outcome is ChatOutcome.SUCCESS:
+            reply_text = generated.reply_text
+        elif (
+            generated.outcome is ChatOutcome.RETRYABLE
+            and context.job_try < context.settings.job_max_tries
+        ):
+            # Nothing is reserved, so the next try starts clean and asks again.
             raise RetryableJobError(generated.reason)
-        if generated.outcome is ChatOutcome.PERMANENT:
-            raise PermanentJobError(generated.reason)
-        reply_text = generated.reply_text
+        else:
+            # Permanent, or out of tries (requirement 4): the fallback goes out
+            # through the SAME exactly-once path as any reply, and a human still
+            # hears about the failure.
+            reply_text = context.settings.agent_fallback_reply
+            failure = generated.reason
 
     # --- T1b -----------------------------------------------------------------
     async with context.sessionmaker() as session:
@@ -561,7 +614,7 @@ async def handle_message(context: EventContext) -> str:
         # send has to come after it.
         state = await conversations.current_state(conversation_id)
         if state is None or state not in _AI_STATES:
-            return await _drop(session, context, inbound_id, conversation_id)
+            return await _drop(session, context, inbound_id, conversation_id, failure)
 
         if reply_text is not None:
             # WITH the text. Once a text is reserved, that text IS the reply:
@@ -580,6 +633,9 @@ async def handle_message(context: EventContext) -> str:
             return "already_replied"
 
         reply_id, text_to_send = reply.id, reply.text
+        if failure is not None:
+            # In THIS transaction, with the reservation (plan conflict C7).
+            await _record_generation_failure(session, context, failure)
         # COMMIT before touching Meta. A reply row written in the same
         # transaction as the wamid would leave no trace of an attempted send, and
         # the retry would have nothing to recognise.
@@ -589,8 +645,16 @@ async def handle_message(context: EventContext) -> str:
     result = await context.meta.send_text(context.phone_number_id, wa_id, text_to_send)
 
     if result.outcome is SendOutcome.RETRYABLE:
-        # The reply row stays QUEUED with no wamid, so the next try recognises it
-        # and sends its STORED text again - never a second model call.
+        if context.job_try >= context.settings.job_max_tries:
+            # The envelope is about to dead-letter this event, so no later try
+            # will ever send this row. Left QUEUED, it would reach later prompts
+            # as something the clinic said (plan conflict C9).
+            async with context.sessionmaker() as session:
+                await MessageRepository(session, context.tenant_id).mark_failed(reply_id)
+                await session.commit()
+        # Otherwise the row stays QUEUED with no wamid, so the next try
+        # recognises it and sends its STORED text again - never a second model
+        # call.
         raise RetryableJobError(result.reason)
 
     if result.outcome is SendOutcome.PERMANENT:
@@ -614,7 +678,11 @@ async def handle_message(context: EventContext) -> str:
         await session.commit()
 
     logger.info("replied event_id=%s conversation_id=%s", context.event_id, conversation_id)
-    return "replied" if result.provider_message_id else "sent_without_id"
+    if not result.provider_message_id:
+        return "sent_without_id"
+    # replied_fallback, not replied: the patient WAS answered, and the dead
+    # letter written above says why it was not an AI reply.
+    return "replied_fallback" if failure is not None else "replied"
 
 
 # Meta's status words, mapped to our vocabulary. Anything not in here is ignored

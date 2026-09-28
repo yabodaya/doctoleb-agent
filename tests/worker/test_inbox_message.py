@@ -920,15 +920,26 @@ async def test_a_retryable_generation_failure_with_tries_left_retries_and_reserv
     assert row.locked_until is None
 
 
-async def test_a_permanent_generation_failure_dead_letters_for_now(sessionmaker_for):
-    """Deliberately temporary: Task 7 rewrites this into the fallback test."""
+async def test_a_permanent_generation_failure_sends_the_fallback_on_the_first_try(
+    sessionmaker_for,
+):
+    """Requirement 4. No credit is not something a retry can fix, so the patient
+    is answered now rather than 75 seconds of backoff later."""
     transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
 
-    _, outcome = await _run(sessionmaker_for, transport, chat=FakeChatClient(permanent()))
+    _, outcome = await _run(sessionmaker_for, transport, None, settings, chat=chat, job_try=1)
 
-    assert outcome == "dead_lettered"
-    assert transport.sends == 0
-    assert (await _one(sessionmaker_for, DeadLetterJob)).error == "openai_insufficient_quota"
+    assert outcome == "replied_fallback"
+    assert len(chat.calls) == 1
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert letter.error == "openai_insufficient_quota"
+    assert letter.attempts == 1
+    assert (await _one(sessionmaker_for, WebhookInbox)).status == InboxStatus.PROCESSED.value
 
 
 async def test_the_generation_log_line_carries_codes_counts_and_the_row_id_only(
@@ -952,3 +963,267 @@ async def test_the_generation_log_line_carries_codes_counts_and_the_row_id_only(
         assert fragment in line, fragment
     for secret in (PATIENT_TEXT, AI_REPLY, "You are the WhatsApp receptionist"):
         assert secret not in line
+
+
+# --- VS-005: when the model fails -------------------------------------------
+
+
+async def test_the_next_try_after_a_generation_failure_generates_again(sessionmaker_for):
+    """Nothing was reserved, so the next try starts clean."""
+    from arq.worker import Retry
+
+    transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(retryable(), ok())
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(Retry):
+        await process_inbox_event(ctx, str(event_id))
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 2
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == AI_REPLY
+    assert await _all(sessionmaker_for, DeadLetterJob) == []
+
+
+async def test_a_retryable_generation_failure_on_the_last_try_sends_the_fallback(sessionmaker_for):
+    """Requirement 4: out of tries is answered, not silently abandoned.
+
+    job_try == job_max_tries is exactly the comparison the envelope makes to
+    decide "dead-letter instead of defer", which is why EventContext carries
+    job_try (plan assumption A7) - the two cannot disagree about which try is
+    last.
+    """
+    transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(retryable())
+
+    _, outcome = await _run(
+        sessionmaker_for, transport, None, settings, chat=chat, job_try=settings.job_max_tries
+    )
+
+    assert outcome == "replied_fallback"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+    assert reply.provider_message_id == wamid(9)
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert letter.error == "openai_http_503"
+    assert letter.attempts == settings.job_max_tries
+    assert (await _one(sessionmaker_for, WebhookInbox)).status == InboxStatus.PROCESSED.value
+
+
+async def test_an_unset_model_sends_the_fallback_without_calling_openai(sessionmaker_for):
+    """Requirement 7, end to end, through the REAL client.
+
+    The fake cannot prove this one: what is being asserted is that no HTTP
+    request is made at all when OPENAI_CHAT_MODEL is blank.
+    """
+    import httpx2
+
+    from app.integrations.openai.chat import OpenAIChatClient
+
+    openai_requests: list[httpx2.Request] = []
+
+    async def record(request: httpx2.Request) -> httpx2.Response:
+        openai_requests.append(request)
+        return httpx2.Response(500, json={"error": {"message": "should never happen"}})
+
+    settings = worker_settings(
+        openai_api_key="sk-test-not-a-real-one",
+        openai_chat_model="",
+    )
+    chat = OpenAIChatClient(
+        settings, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(record))
+    )
+    transport = Meta()
+
+    _, outcome = await _run(sessionmaker_for, transport, None, settings, chat=chat)
+
+    assert outcome == "replied_fallback"
+    assert openai_requests == []
+    assert transport.sends == 1
+    body = json.loads(transport.requests[0].content)["text"]["body"]
+    assert body == settings.agent_fallback_reply
+    assert (await _one(sessionmaker_for, DeadLetterJob)).error == "openai_model_unset"
+
+
+async def test_the_fallback_and_its_dead_letter_are_committed_together_before_the_send(
+    sessionmaker_for, second_session_factory
+):
+    """Plan conflict C7's reason for putting the dead letter in T1b.
+
+    Written earlier, in its own transaction, a crash before the reservation
+    would leave a dead letter for a failure that had since healed. Written
+    later, with the wamid, a crash during the send would lose it. In T1b the
+    two facts - "the fallback is the reply" and "generation failed for this
+    reason" - commit together or not at all.
+    """
+    seen = []
+    settings = worker_settings()
+
+    async def peek(request):
+        async with second_session_factory() as other:
+            replies = (
+                await other.scalars(
+                    sa.select(Message).where(Message.direction == MessageDirection.OUTBOUND.value)
+                )
+            ).all()
+            letters = (await other.scalars(sa.select(DeadLetterJob))).all()
+            seen.append(
+                (
+                    [(r.status, r.text) for r in replies],
+                    [letter.error for letter in letters],
+                )
+            )
+
+    await _run(sessionmaker_for, Meta(hook=peek), None, settings, chat=FakeChatClient(permanent()))
+
+    assert seen == [
+        (
+            [(MessageStatus.QUEUED.value, settings.agent_fallback_reply)],
+            ["openai_insufficient_quota"],
+        )
+    ]
+
+
+async def test_a_crash_after_the_fallback_is_reserved_neither_loses_nor_repeats_its_dead_letter(
+    sessionmaker_for,
+):
+    """The exactly-once property the T1b placement buys.
+
+    A plain RuntimeError from the transport is a crash, not a Meta failure: it
+    escapes the envelope's two except blocks entirely, which is the closest a
+    test can get to the process being killed mid-send.
+    """
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
+    crashed = {"done": False}
+
+    async def crash_once(request):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("the worker died mid-send")
+
+    transport = Meta(hook=crash_once)
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(RuntimeError):
+        await process_inbox_event(ctx, str(event_id))
+
+    # The lease is still held by the dead run; clear it the way VS-004's tests do.
+    async with sessionmaker_for() as session:
+        await session.execute(
+            sa.update(WebhookInbox).where(WebhookInbox.id == event_id).values(locked_until=None)
+        )
+        await session.commit()
+
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    # `replied`, not `replied_fallback`: the outcome code says what THIS run
+    # did, and this run sent a stored reply without generating anything. The
+    # dead letter written by the crashed run is where the generation failure is
+    # recorded - which is the whole point of committing it with the reservation.
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    letters = await _all(sessionmaker_for, DeadLetterJob)
+    assert [letter.error for letter in letters] == ["openai_insufficient_quota"]
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+
+
+async def test_a_retried_fallback_send_does_not_call_the_model_or_write_a_second_dead_letter(
+    sessionmaker_for,
+):
+    """The fallback goes through the SAME exactly-once path as any reply."""
+    from arq.worker import Retry
+
+    transport = Meta(httpx.Response(500, json={"error": {"code": 1}}), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(Retry):
+        await process_inbox_event(ctx, str(event_id))
+    ctx["job_try"] = 2
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    assert len(await _all(sessionmaker_for, DeadLetterJob)) == 1
+    bodies = [json.loads(r.content)["text"]["body"] for r in transport.requests]
+    assert bodies == [settings.agent_fallback_reply] * 2
+
+
+async def test_a_fallback_refused_by_meta_leaves_two_dead_letters_with_two_reasons(
+    sessionmaker_for,
+):
+    """Two different things went wrong, and each has a different fix."""
+    transport = Meta(httpx.Response(400, json={"error": {"code": 131030}}))
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=FakeChatClient(permanent()))
+
+    assert outcome == "dead_lettered"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.status == MessageStatus.FAILED.value
+    errors = sorted(letter.error for letter in await _all(sessionmaker_for, DeadLetterJob))
+    assert errors == ["http_400 code_131030", "openai_insufficient_quota"]
+
+
+async def test_a_generation_failure_then_a_takeover_keeps_the_dead_letter_and_sends_nothing(
+    sessionmaker_for, second_session_factory
+):
+    """Hard rule 7 still wins over the fallback - and the failure is still
+    recorded, because it still happened and somebody still has to fix it."""
+
+    async def takeover(messages):
+        await _staff_takeover(second_session_factory)
+
+    transport = Meta()
+    chat = FakeChatClient(permanent(), hook=takeover)
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=chat)
+
+    assert outcome == "dropped_not_ai_active"
+    assert transport.sends == 0
+    assert await _all(sessionmaker_for, Message, direction="OUTBOUND") == []
+    assert (await _one(sessionmaker_for, DeadLetterJob)).error == "openai_insufficient_quota"
+
+
+async def test_a_reply_that_runs_out_of_send_tries_is_marked_failed(sessionmaker_for):
+    """Plan conflict C9, on the Meta side.
+
+    The envelope is about to dead-letter this event, so no later try will ever
+    send this row. Left QUEUED it would reach later prompts as something the
+    clinic said.
+    """
+    transport = Meta(httpx.Response(500, json={"error": {"code": 1}}))
+    settings = worker_settings()
+
+    _, outcome = await _run(
+        sessionmaker_for, transport, None, settings, job_try=settings.job_max_tries
+    )
+
+    assert outcome == "dead_lettered"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.status == MessageStatus.FAILED.value
+    assert reply.provider_message_id is None
+
+
+async def test_a_generation_dead_letter_carries_codes_and_references_only(sessionmaker_for):
+    """Hard rule 8. dead_letter_jobs is a table people open casually to triage."""
+    _, _ = await _run(sessionmaker_for, Meta(), chat=FakeChatClient(permanent()))
+
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert set(letter.payload) == {"inbox_row_id", "kind", "phone_number_id", "job_try"}
+    assert letter.error == "openai_insufficient_quota"
+    assert letter.tenant_id == dbf.TENANT_A
+    serialised = f"{letter.payload}{letter.error}{letter.source_event_id}{letter.job_name}"
+    for secret in (PATIENT_TEXT, AI_REPLY, wamid(1), wamid(9), PROFILE_NAME):
+        assert secret not in serialised

@@ -246,6 +246,10 @@ async def test_a_meta_outage_retries_and_then_dead_letters_without_replying(
 
     Five tries, all 500. One dead letter, no wamid anywhere, no lease left behind,
     and the patient told nothing untrue.
+
+    VS-005 (plan conflict C9): the reply row ends FAILED, not QUEUED. No later
+    try will ever send it, and a row left QUEUED would reach later prompts as
+    something the clinic said - while also still claiming a reply is on its way.
     """
     transport = Meta(httpx.Response(500, json={"error": {"code": 1}}))
     await pipeline.post(envelope(messages=[text_message(1)]))
@@ -272,7 +276,7 @@ async def test_a_meta_outage_retries_and_then_dead_letters_without_replying(
 
     reply = (await _rows(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value))[0]
     assert reply.provider_message_id is None
-    assert reply.status == MessageStatus.QUEUED.value
+    assert reply.status == MessageStatus.FAILED.value
     inbox = (await _rows(sessionmaker_for, WebhookInbox))[0]
     assert inbox.status == InboxStatus.FAILED.value
     assert inbox.locked_until is None, "a dead-lettered row must not stay leased"
