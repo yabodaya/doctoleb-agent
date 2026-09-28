@@ -6,10 +6,12 @@ is always a MockTransport.
 """
 
 import asyncio
+import json
 import logging
 import time
 
 import httpx
+import httpx2
 import pytest
 import sqlalchemy as sa
 from arq.worker import Retry
@@ -18,10 +20,12 @@ from app.config import Settings, get_settings
 from app.db.enums import InboxStatus, MessageDirection, MessageStatus
 from app.db.models import DeadLetterJob, Message, WebhookInbox
 from app.db.session import get_session
+from app.integrations.openai.chat import OpenAIChatClient
 from app.main import create_app
 from app.queue import get_job_queue
 from app.worker.jobs.inbox import process_inbox_event
 from tests.db import factories as dbf
+from tests.integrations.fakes import FakeChatClient, ok
 from tests.queue.fakes import FakeJobQueue
 from tests.whatsapp_factories import (
     APP_SECRET,
@@ -96,9 +100,22 @@ def pipeline(sessionmaker_for, client_for):
             async with client_for(app) as client:
                 return await client.post(PATH, content=raw, headers=headers)
 
-        async def drain(self, transport: Meta, expect_retry: bool = False):
-            """Run a job for every id the webhook enqueued, in order."""
-            ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings)
+        async def drain(self, transport: Meta, expect_retry: bool = False, **ctx_overrides):
+            """Run a job for every id the webhook enqueued, in order.
+
+            `chat` defaults to job_context's FakeChatClient. Tests whose point is
+            the real classifier or the real request body pass an OpenAIChatClient
+            built on an httpx2.MockTransport instead; `settings` overrides the
+            job's settings without rebuilding the app, which only needs the Meta
+            and tenant halves that are identical either way.
+            """
+            job_settings = ctx_overrides.pop("settings", settings)
+            ctx = job_context(
+                sessionmaker_for,
+                meta_client(transport, job_settings),
+                job_settings,
+                **ctx_overrides,
+            )
             outcomes = []
             while self.queue.enqueued:
                 row_id = self.queue.enqueued.pop(0)
@@ -310,3 +327,270 @@ async def test_nothing_in_redis_or_the_logs_from_a_full_run_contains_a_wamid(
     # And the row ids ARE there, or the lines carry nothing to correlate with.
     for row_id in enqueued:
         assert str(row_id) in every_line
+
+
+# --- VS-005: the AI reply, end to end ---------------------------------------
+
+
+def openai_settings(**overrides) -> Settings:
+    """app_settings with an OpenAI account configured. Never a real key."""
+    values = {"openai_api_key": "sk-test-not-a-real-one", "openai_chat_model": "test-model"}
+    values.update(overrides)
+    return app_settings(**values)
+
+
+class OpenAI:
+    """A recording httpx2 transport for the REAL OpenAIChatClient.
+
+    The counterpart of `Meta`. Used where the point is what actually goes on the
+    wire, or what the real classifier does with what comes back - neither of
+    which a fake ChatClient can prove.
+    """
+
+    def __init__(self, *responses):
+        self.requests: list[httpx2.Request] = []
+        self._responses = list(responses)
+
+    async def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        return self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
+
+    @property
+    def calls(self) -> int:
+        return len(self.requests)
+
+    def bodies(self) -> list[dict]:
+        return [json.loads(r.content) for r in self.requests]
+
+
+def completion(text: str) -> httpx2.Response:
+    """A Chat Completions body in the shape the SDK parses."""
+    return httpx2.Response(
+        200,
+        json={
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1730000000,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 9, "total_tokens": 49},
+        },
+    )
+
+
+def real_chat(transport: OpenAI, settings: Settings) -> OpenAIChatClient:
+    return OpenAIChatClient(
+        settings, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(transport))
+    )
+
+
+async def test_a_webhook_delivery_becomes_one_ai_reply(sessionmaker_for, pipeline):
+    """The slice's headline: the model's words reach the patient, unaltered.
+
+    The real client, so the text asserted in Meta's request body is the text
+    that came out of an OpenAI response body and through the real parser.
+    """
+    settings = openai_settings()
+    openai = OpenAI(completion("Hello! How can the clinic help you today?"))
+    meta = Meta(ok_response(9))
+
+    assert (await pipeline.post(envelope(messages=[text_message(1)]))).status_code == 200
+    outcomes = await pipeline.drain(meta, chat=real_chat(openai, settings), settings=settings)
+
+    assert outcomes == ["replied"]
+    assert openai.calls == 1
+    body = json.loads(meta.requests[0].content)["text"]["body"]
+    assert body == "Hello! How can the clinic help you today?"
+    reply = (await _rows(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value))[0]
+    assert reply.text == "Hello! How can the clinic help you today?"
+
+
+async def test_the_same_webhook_delivered_twice_calls_the_model_once_and_replies_once(
+    sessionmaker_for, pipeline
+):
+    """Hard rule 2, now with a bill attached to getting it wrong."""
+    settings = openai_settings()
+    openai = OpenAI(completion("one reply only"))
+    meta = Meta(ok_response(9))
+    body = envelope(messages=[text_message(1)])
+
+    await pipeline.post(body)
+    await pipeline.post(body)
+    outcomes = await pipeline.drain(meta, chat=real_chat(openai, settings), settings=settings)
+
+    assert outcomes == ["replied", "skipped"]
+    assert openai.calls == 1
+    assert meta.sends == 1
+    assert len(await _rows(sessionmaker_for, Message)) == 2
+
+
+async def test_the_webhook_answers_fast_when_the_model_is_slow(pipeline):
+    """Hard rule 1, with the new slow thing.
+
+    The fake model sleeps for two seconds. The webhook must not care, because
+    the webhook never calls a model - so the request is timed AND the fake is
+    asserted untouched during it.
+    """
+
+    async def stall(messages):
+        await asyncio.sleep(2)
+
+    chat = FakeChatClient(ok(), hook=stall)
+
+    started = time.monotonic()
+    response = await pipeline.post(envelope(messages=[text_message(1)]))
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 1
+    assert chat.calls == []
+
+    assert await pipeline.drain(Meta(ok_response(9)), chat=chat) == ["replied"]
+    assert len(chat.calls) == 1
+
+
+async def test_the_second_message_carries_the_first_exchange_to_the_model(pipeline):
+    """Requirement 5, at the boundary where it is finally observable.
+
+    Same patient, two messages: the second request must carry the first
+    exchange as user/assistant turns, in order, with the new message last.
+    """
+    settings = openai_settings()
+    openai = OpenAI(completion("first answer"), completion("second answer"))
+    meta = Meta(ok_response(8), ok_response(9))
+
+    await pipeline.post(envelope(messages=[text_message(1)]))
+    await pipeline.drain(meta, chat=real_chat(openai, settings), settings=settings)
+    await pipeline.post(
+        envelope(messages=[text_message(1, body="and about the cost?", id=wamid(2))])
+    )
+    await pipeline.drain(meta, chat=real_chat(openai, settings), settings=settings)
+
+    second = openai.bodies()[1]["messages"]
+    assert [m["role"] for m in second] == ["system", "user", "assistant", "user"]
+    assert second[0]["content"].startswith("You are the WhatsApp receptionist")
+    assert [m["content"] for m in second[1:]] == [
+        PATIENT_TEXT,
+        "first answer",
+        "and about the cost?",
+    ]
+
+
+async def test_the_model_request_contains_no_ids_names_or_phone_numbers(sessionmaker_for, pipeline):
+    """Hard rules 4 and 8, at the boundary where data leaves our systems.
+
+    tenant_id is carried on the Turn for VS-006's tools and must never be sent;
+    neither must the contact, conversation or inbox ids, the WhatsApp profile
+    name, the patient's number, or a wamid - which is base64 and decodes to
+    include that number.
+    """
+    settings = openai_settings()
+    openai = OpenAI(completion("a reply"))
+
+    await pipeline.post(envelope(messages=[text_message(1)]))
+    await pipeline.drain(Meta(ok_response(9)), chat=real_chat(openai, settings), settings=settings)
+
+    sent = openai.requests[0].content.decode("utf-8")
+    forbidden = [str(dbf.TENANT_A), PROFILE_NAME, phone(1), wamid(1), wamid(9)]
+    for model in (Message, WebhookInbox):
+        for row in await _rows(sessionmaker_for, model):
+            forbidden.append(str(row.id))
+    for value in forbidden:
+        assert value not in sent, value
+
+
+async def test_an_openai_outage_retries_then_answers_with_the_fallback(sessionmaker_for, pipeline):
+    """One retry layer, observed end to end: five tries, five requests.
+
+    max_retries=0 is what makes those two numbers equal. At the SDK's default
+    of 2 it would be fifteen requests, fifteen bills, and a dead letter saying
+    five.
+    """
+    settings = openai_settings()
+    openai = OpenAI(httpx2.Response(503, json={"error": {"message": "unavailable"}}))
+    meta = Meta(ok_response(9))
+
+    await pipeline.post(envelope(messages=[text_message(1)]))
+    row_id = pipeline.queue.enqueued[0]
+    ctx = job_context(
+        sessionmaker_for,
+        meta_client(meta, settings),
+        settings,
+        chat=real_chat(openai, settings),
+    )
+
+    outcomes = []
+    for job_try in range(1, settings.job_max_tries + 1):
+        ctx["job_try"] = job_try
+        try:
+            outcomes.append(await process_inbox_event(ctx, str(row_id)))
+        except Retry:
+            outcomes.append("retry")
+
+    assert outcomes == ["retry"] * (settings.job_max_tries - 1) + ["replied_fallback"]
+    assert openai.calls == settings.job_max_tries
+    assert meta.sends == 1
+    body = json.loads(meta.requests[0].content)["text"]["body"]
+    assert body == settings.agent_fallback_reply
+    letters = await _rows(sessionmaker_for, DeadLetterJob)
+    assert [letter.error for letter in letters] == ["openai_http_503"]
+    assert (await _rows(sessionmaker_for, WebhookInbox))[0].status == InboxStatus.PROCESSED.value
+
+
+async def test_nothing_sensitive_reaches_logs_job_results_redis_or_dead_letters(
+    sessionmaker_for, pipeline, caplog
+):
+    """Requirement 8, on every channel at once.
+
+    One successful run and one no-credit run, through the REAL client, with a
+    sentinel for each of the four things that must never escape: the patient's
+    text, the model's reply, OpenAI's error message, and the key.
+    """
+    key = "sk-SENTINEL-key-not-a-real-one"
+    settings = openai_settings(openai_api_key=key)
+    patient = "SENTINEL-patient-text"
+    reply = "SENTINEL-generated-reply"
+    error_body = "SENTINEL-openai-error-message"
+
+    healthy = OpenAI(completion(reply))
+    no_credit = OpenAI(
+        httpx2.Response(
+            429,
+            json={
+                "error": {
+                    "message": error_body,
+                    "type": "insufficient_quota",
+                    "param": None,
+                    "code": "insufficient_quota",
+                }
+            },
+        )
+    )
+    meta = Meta(ok_response(8), ok_response(9))
+    enqueued: list = []
+
+    with caplog.at_level(logging.DEBUG):
+        await pipeline.post(envelope(messages=[text_message(1, body=patient)]))
+        enqueued.extend(pipeline.queue.enqueued)
+        first = await pipeline.drain(meta, chat=real_chat(healthy, settings), settings=settings)
+        await pipeline.post(envelope(messages=[text_message(1, body=patient, id=wamid(2))]))
+        enqueued.extend(pipeline.queue.enqueued)
+        second = await pipeline.drain(meta, chat=real_chat(no_credit, settings), settings=settings)
+
+    assert first == ["replied"]
+    assert second == ["replied_fallback"]
+
+    letters = await _rows(sessionmaker_for, DeadLetterJob)
+    assert [letter.error for letter in letters] == ["openai_insufficient_quota"]
+    haystack = "\n".join(
+        [caplog.text, *first, *second, *(str(row_id) for row_id in enqueued)]
+        + [f"{letter.payload}{letter.error}{letter.source_event_id}" for letter in letters]
+    )
+    for sentinel in (patient, reply, error_body, key):
+        assert sentinel not in haystack, sentinel
