@@ -486,41 +486,69 @@ async def test_a_closed_conversation_drops_the_reply(sessionmaker_for):
     assert len(await _all(sessionmaker_for, Conversation)) == 2
 
 
-async def test_the_state_is_re_read_immediately_before_the_send(sessionmaker_for, monkeypatch):
-    """Review Focus 10.
+async def test_the_state_is_re_read_immediately_before_the_send(
+    sessionmaker_for, second_session_factory, monkeypatch
+):
+    """Review Focus 10, and the only version of it that tests anything.
 
     A human taking the conversation over WHILE the job runs must still stop the
-    reply. Simulated by flipping the state during the contact upsert, which is
-    after get_or_create_open and before the rule-7 re-read.
+    reply. Three things have to be true of the simulation or it proves nothing:
+
+    * the flip happens immediately AFTER get_or_create_open has loaded the
+      conversation into the job's session, because that is the window rule 7
+      exists to cover;
+    * it happens in an INDEPENDENT session and is COMMITTED, the way a staff
+      member taking over in the dashboard would; and
+    * the job's own session is never told about it, which is exactly the
+      condition under which SQLAlchemy's identity map hands back the stale object
+      it already has.
+
+    The earlier version of this test flipped the state inside the job's own
+    session during the contact upsert - before the conversation was ever loaded -
+    so the re-read had nothing stale to find, and the test passed against a
+    re-read that never went to the database.
+
+    The hook is on get_or_create_open's RETURN and not on the step after it:
+    MessageRepository.add updates conversations.last_inbound_at, which takes a row
+    lock, so an independent session flipping the state after that point blocks on
+    the job's uncommitted transaction while the job waits for it - a deadlock in
+    the test, not a finding about the code.
     """
-    from app.db.repositories import ContactRepository
+    from app.db.repositories import ConversationRepository
 
-    original = ContactRepository.get_or_create_by_identity
-    flipped = {"done": False}
+    original = ConversationRepository.get_or_create_open
+    flipped = {"armed": False}
 
-    async def flip_after(self, channel, external_id, display_name=None):
-        contact = await original(self, channel, external_id, display_name)
-        if not flipped["done"]:
-            flipped["done"] = True
-            await self._session.execute(
-                sa.update(Conversation).values(state=ConversationState.HUMAN_ACTIVE.value)
-            )
-        return contact
+    async def load_then_flip(self, contact_id, channel):
+        conversation = await original(self, contact_id, channel)
+        if flipped["armed"]:
+            flipped["armed"] = False
+            async with second_session_factory() as staff:
+                await staff.execute(
+                    sa.update(Conversation)
+                    .where(Conversation.id == conversation.id)
+                    .values(state=ConversationState.HUMAN_ACTIVE.value)
+                )
+                await staff.commit()
+        return conversation
 
-    transport = Meta()
+    # Two distinct wamids, so that a second send fails this test's ASSERTION
+    # rather than the unique constraint on provider_message_id - the symptom
+    # should name the bug, not a scripting artefact.
+    transport = Meta(ok_response(8), ok_response(9))
     settings = worker_settings()
-    # Open a conversation first, with the flip disabled.
-    flipped["done"] = True
+    # First message opens the conversation, with the flip disarmed.
     await _run(sessionmaker_for, transport, message_payload(1), settings, n=1)
 
-    flipped["done"] = False
-    monkeypatch.setattr(ContactRepository, "get_or_create_by_identity", flip_after)
+    flipped["armed"] = True
+    monkeypatch.setattr(ConversationRepository, "get_or_create_open", load_then_flip)
     _, outcome = await _run(
         sessionmaker_for, transport, message_payload(1, id=wamid(2)), settings, n=2
     )
 
     assert outcome == "dropped_not_ai_active"
-    assert transport.sends == 1
+    assert transport.sends == 1  # the first message's reply, and nothing since
+    assert len(await _all(sessionmaker_for, Message, direction="OUTBOUND")) == 1
 
 
 async def test_a_dropped_reply_logs_ids_only(sessionmaker_for, caplog):

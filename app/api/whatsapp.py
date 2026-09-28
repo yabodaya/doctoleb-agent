@@ -9,14 +9,12 @@ Hard rule 8: every log line here carries identifiers and counts. A message body,
 a profile name and a phone number never appear in a log, an exception, or a
 response body.
 
-VS-003 also reasoned that a wamid is "an opaque Meta identifier, not patient
-content", and its happy-path line prints provider_event_id values on that basis.
-VS-004 found that reasoning to be wrong (plan note C2): a wamid is base64 and
-commonly decodes to include the patient's phone number, and a status event id
-carries the wamid of the message we sent TO the patient. Every line VS-004 adds
-therefore identifies an event by our own webhook_inbox row id. VS-003's line is
-left alone (note C2a) because it is a merged slice's tested log contract, and
-narrowing it is its own change - it is a Follow-up on VS-004, not a task in it.
+VS-003 reasoned that a wamid is "an opaque Meta identifier, not patient content"
+and logged provider_event_id values on that basis. That reasoning is wrong (plan
+note C2): a wamid is base64 and commonly decodes to include the patient's phone
+number, and a status event id carries the wamid of the message we sent TO the
+patient. Every line in this module now identifies an event by our own
+webhook_inbox row id, which is ours, opaque, and useful for correlation.
 """
 
 import hmac
@@ -193,18 +191,17 @@ async def receive(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="storage unavailable"
         ) from None
 
-    # VS-003's line, left as VS-003 wrote it, on purpose. It prints
-    # provider_event_id values - wamids - which plan note C2a says are patient
-    # content and C2a says are NOT this slice's to change: it is a merged slice's
-    # tested log contract (tests/api/test_webhook_logging.py asserts the wamids
-    # are present), and narrowing it is its own piece of work. Every line VS-004
-    # writes below uses the row id instead, so this slice adds nothing to the
-    # problem. Recorded as a Follow-up on VS-004.
+    # Row ids, not provider_event_id values. VS-003 logged the latter on the
+    # reasoning that a wamid is "an opaque Meta identifier, not patient content";
+    # it is base64 and commonly decodes to include the patient's phone number, and
+    # a status event id carries the wamid of the message we sent TO the patient.
+    # Closed here rather than left as a follow-up: this is the one line in the
+    # system that prints one on every successful delivery.
     logger.info(
-        "whatsapp webhook stored events=%d new=%d ids=%s",
+        "whatsapp webhook stored events=%d new=%d event_ids=%s",
         len(items),
         new_count,
-        ",".join(item.provider_event_id for item in items),
+        ",".join(str(row_id) for row_id in row_ids),
     )
 
     # --- enqueue (VS-004) --------------------------------------------------

@@ -281,12 +281,12 @@ async def test_a_meta_outage_retries_and_then_dead_letters_without_replying(
 async def test_nothing_in_redis_or_the_logs_from_a_full_run_contains_a_wamid(
     sessionmaker_for, pipeline, caplog
 ):
-    """Plan note C2, once over the whole path.
+    """Plan note C2, once over the whole path, with nothing excluded.
 
-    One test that fails if any future log line in this slice reaches for the
-    obvious identifier. VS-003's own "stored" line is excluded by name: it prints
-    provider_event_id values on a premise VS-004 found to be wrong, and note C2a
-    records that narrowing it is its own change rather than this slice's.
+    One test that fails if any log line anywhere on this path reaches for the
+    obvious identifier. The webhook's own "stored" line used to be excluded by
+    name - it printed provider_event_id values, inherited from VS-003 - and now
+    logs row ids like everything else, so the exclusion is gone.
     """
     transport = Meta(ok_response(9))
 
@@ -300,10 +300,9 @@ async def test_nothing_in_redis_or_the_logs_from_a_full_run_contains_a_wamid(
     for row_id in enqueued:
         assert wamid(1) not in str(row_id)
 
-    ours = "\n".join(
-        record.getMessage()
-        for record in caplog.records
-        if "whatsapp webhook stored" not in record.getMessage()
-    )
+    every_line = "\n".join(record.getMessage() for record in caplog.records)
     for forbidden in (wamid(1), wamid(9), PATIENT_TEXT, PROFILE_NAME, phone(1), ACCESS_TOKEN):
-        assert forbidden not in ours
+        assert forbidden not in every_line
+    # And the row ids ARE there, or the lines carry nothing to correlate with.
+    for row_id in enqueued:
+        assert str(row_id) in every_line

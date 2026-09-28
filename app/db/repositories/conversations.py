@@ -20,6 +20,32 @@ class ConversationRepository(TenantScopedRepository):
             )
         )
 
+    async def current_state(self, conversation_id: uuid.UUID) -> str | None:
+        """Read this conversation's state FROM THE DATABASE, always.
+
+        Hard rule 7 re-reads the state immediately before sending, to catch a
+        human taking the thread over while the job was doing something else. `get`
+        cannot serve that purpose in the session that already loaded the
+        conversation: a `select()` for a mapped entity is resolved through
+        SQLAlchemy's identity map, so it returns the instance that is already
+        there - with the state it had when it was loaded - and never notices that
+        another transaction has committed a change since.
+
+        Selecting the COLUMN instead of the entity sidesteps the identity map
+        entirely: there is no instance to return, so the value can only come from
+        the round trip. `populate_existing()` on the entity query would work too;
+        this is the narrower tool, and the return type says what the caller
+        actually needs.
+
+        Returns None for a missing conversation, or for another tenant's id.
+        """
+        return await self._session.scalar(
+            sa.select(Conversation.state).where(
+                Conversation.id == conversation_id,
+                Conversation.tenant_id == self.tenant_id,
+            )
+        )
+
     async def get_open(self, contact_id: uuid.UUID, channel: str) -> Conversation | None:
         """The one non-CLOSED conversation, if there is one.
 

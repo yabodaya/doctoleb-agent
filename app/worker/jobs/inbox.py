@@ -431,11 +431,18 @@ async def handle_message(context: EventContext) -> str:
             )
             return "stored_no_reply"
 
-        # Hard rule 7, re-read from the database rather than trusted from the
-        # get-or-create above: a human may have taken this conversation over
-        # while the job was resolving a tenant.
-        current = await conversations.get(conversation_id)
-        if current is None or current.state not in _AI_STATES:
+        # Hard rule 7, re-read from the DATABASE rather than trusted from the
+        # get-or-create above: a human may have taken this conversation over while
+        # the job was resolving a tenant or storing the message.
+        #
+        # current_state() selects the state COLUMN, not the entity, and that is
+        # the whole point. A select() for a mapped Conversation in this session is
+        # resolved through SQLAlchemy's identity map and hands back the instance
+        # get_or_create_open already loaded, with the state it had then - so the
+        # "re-read" would never see a commit made by anyone else, which is the
+        # only thing it exists to see.
+        state = await conversations.current_state(conversation_id)
+        if state is None or state not in _AI_STATES:
             await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
             await session.commit()
             # Ids only, never the message (hard rule 7's own wording).

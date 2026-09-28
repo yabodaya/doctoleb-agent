@@ -5,6 +5,7 @@ VS-002 adds models, a session factory and repositories on the same engine.
 """
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -50,17 +51,33 @@ async def ping_database() -> None:
         await connection.execute(text("SELECT 1"))
 
 
+# The options every session in this application is built with. Named once, and
+# exported, so a test harness cannot quietly diverge from production: VS-004's
+# worker tests build their own factory bound to the test engine, and
+# tests/db/test_session.py asserts they use exactly this.
+#
+# expire_on_commit=False: after a commit, the caller can still read the attributes
+# of the object it just saved without a second round trip. With the default, every
+# attribute access after a commit re-queries, and in async code that raises
+# MissingGreenlet instead of being merely slow. VS-004's job depends on it
+# directly - it commits the claim and then reads row.payload.
+#
+# NOTE what this does NOT buy: an object already in the identity map is not
+# refreshed either, so a "re-read" of a mapped entity in the same session returns
+# the stale instance. Hard rule 7's state check selects the column instead - see
+# ConversationRepository.current_state.
+#
+# autoflush=False: repositories flush where they mean to. Implicit flushes before
+# every SELECT make it unclear which statement actually wrote a row, and they can
+# fire a half-built object into the database mid-method.
+SESSION_OPTIONS: dict[str, Any] = {"expire_on_commit": False, "autoflush": False}
+
+
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     """Return the process-wide session factory, building it on first use."""
     global _sessionmaker
     if _sessionmaker is None:
-        # expire_on_commit=False: after a commit, the caller can still read the
-        # attributes of the object it just saved without a second round trip.
-        # With the default, every attribute access after commit re-queries, and
-        # in async code that raises MissingGreenlet instead of being merely slow.
-        _sessionmaker = async_sessionmaker(
-            bind=get_engine(), expire_on_commit=False, autoflush=False
-        )
+        _sessionmaker = async_sessionmaker(bind=get_engine(), **SESSION_OPTIONS)
     return _sessionmaker
 
 

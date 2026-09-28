@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.channels.whatsapp.client import MetaClient
 from app.config import Settings
 from app.db.models import WebhookInbox
+from app.db.session import SESSION_OPTIONS
 from app.tenants import ConfigTenantResolver
 from tests.db import factories as f
 from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
@@ -127,8 +128,15 @@ def sessionmaker_for(db_engine):  # noqa: F811
     The job commits three times and reads its own writes back across
     transactions, so it cannot run on the rollback-wrapped db_session. Tests
     using this clean up after themselves through the `clean_database` fixture.
+
+    Built with **SESSION_OPTIONS - the same options app/db/session.py gives the
+    production factory - and not a hand-written expire_on_commit=False. The job
+    reads row.payload after committing the claim, which works only because the
+    session does not expire on commit; a harness that set that itself would keep
+    passing if production ever stopped doing it, and the job would fail live with
+    MissingGreenlet. tests/db/test_session.py asserts the two match.
     """
-    return async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    return async_sessionmaker(bind=db_engine, **SESSION_OPTIONS)
 
 
 @pytest.fixture(autouse=True)
