@@ -8,7 +8,7 @@ Work in order. Set exactly one slice to IN PROGRESS at a time.
 | VS-003 | Receive WhatsApp webhook | PARTIAL |
 | VS-004 | Worker + send reply | PARTIAL |
 | VS-005 | AI replies | PARTIAL |
-| VS-006 | Agent Core + first tool | IN PROGRESS |
+| VS-006 | Agent Core + first tool | PARTIAL |
 | VS-007 | Booking tools | TODO |
 | VS-008 | Voice notes in | TODO |
 | VS-009 | Voice note replies | TODO |

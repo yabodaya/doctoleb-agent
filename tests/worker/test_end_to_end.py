@@ -16,25 +16,18 @@ import pytest
 import sqlalchemy as sa
 from arq.worker import Retry
 
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.db.enums import InboxStatus, MessageDirection, MessageStatus
 from app.db.models import DeadLetterJob, Message, WebhookInbox
-from app.db.session import get_session
 from app.integrations.openai.chat import OpenAIChatClient
-from app.main import create_app
-from app.queue import get_job_queue
 from app.worker.jobs.inbox import process_inbox_event
 from tests.db import factories as dbf
 from tests.integrations.fakes import FakeChatClient, ok
-from tests.queue.fakes import FakeJobQueue
 from tests.whatsapp_factories import (
-    APP_SECRET,
     PATIENT_TEXT,
     PROFILE_NAME,
-    VERIFY_TOKEN,
     envelope,
     phone,
-    signed,
     status_update,
     text_message,
     wamid,
@@ -42,6 +35,7 @@ from tests.whatsapp_factories import (
 from tests.worker.conftest import (
     ACCESS_TOKEN,
     Meta,
+    app_settings,
     job_context,
     meta_client,
     ok_response,
@@ -50,84 +44,6 @@ from tests.worker.conftest import (
 pytestmark = pytest.mark.db
 
 PATH = "/webhooks/whatsapp"
-
-
-def app_settings(**overrides) -> Settings:
-    """Settings for the whole path: real Meta fakes, and a mapped tenant."""
-    values = {
-        "app_env": "test",
-        "database_url": "postgresql+asyncpg://user:pw@localhost:5432/doctoleb",
-        "redis_url": "redis://localhost:6379/0",
-        "meta_app_secret": APP_SECRET,
-        "meta_verify_token": VERIFY_TOKEN,
-        "meta_access_token": ACCESS_TOKEN,
-        "meta_api_version": "v21.0",
-        "meta_api_base_url": "https://graph.facebook.com",
-        "whatsapp_tenant_map": f'{{"100000000000001": "{dbf.TENANT_A}"}}',
-    }
-    values.update(overrides)
-    return Settings(_env_file=None, **values)
-
-
-@pytest.fixture
-def pipeline(sessionmaker_for, client_for):
-    """A webhook client and a queue, both wired to the committing sessionmaker.
-
-    Deliberately NOT the `use_database` fixture: the whole point of these tests
-    is that the worker reads in a different transaction from the one the webhook
-    wrote in, which the rollback-wrapped session cannot express.
-    """
-    settings = app_settings()
-    app = create_app(settings)
-    queue = FakeJobQueue()
-
-    async def session_override():
-        async with sessionmaker_for() as session:
-            yield session
-
-    app.dependency_overrides[get_settings] = lambda: settings
-    app.dependency_overrides[get_session] = session_override
-    app.dependency_overrides[get_job_queue] = lambda: queue
-
-    class Pipeline:
-        def __init__(self):
-            self.settings = settings
-            self.queue = queue
-            self.transport: Meta | None = None
-
-        async def post(self, body):
-            raw, headers = signed(body, secret=APP_SECRET)
-            async with client_for(app) as client:
-                return await client.post(PATH, content=raw, headers=headers)
-
-        async def drain(self, transport: Meta, expect_retry: bool = False, **ctx_overrides):
-            """Run a job for every id the webhook enqueued, in order.
-
-            `chat` defaults to job_context's FakeChatClient. Tests whose point is
-            the real classifier or the real request body pass an OpenAIChatClient
-            built on an httpx2.MockTransport instead; `settings` overrides the
-            job's settings without rebuilding the app, which only needs the Meta
-            and tenant halves that are identical either way.
-            """
-            job_settings = ctx_overrides.pop("settings", settings)
-            ctx = job_context(
-                sessionmaker_for,
-                meta_client(transport, job_settings),
-                job_settings,
-                **ctx_overrides,
-            )
-            outcomes = []
-            while self.queue.enqueued:
-                row_id = self.queue.enqueued.pop(0)
-                try:
-                    outcomes.append(await process_inbox_event(ctx, str(row_id)))
-                except Retry:
-                    if not expect_retry:
-                        raise
-                    outcomes.append("retry")
-            return outcomes
-
-    return Pipeline()
 
 
 async def _rows(sessionmaker, model, **where):

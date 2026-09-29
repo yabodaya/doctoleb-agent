@@ -22,10 +22,12 @@ worker job:
           upsert contact + conversation, store message
           if conversation not AI_ACTIVE -> stop
           load the recent history, COMMIT and CLOSE the transaction
-          Agent Core: process_turn(...) -> OpenAI with tools
-            tool calls -> BookingClient -> Booking Service
+          Agent Core: process_turn(...) -> the tool loop, under ONE deadline
+            <=4 model calls, each offered the three read-only tools
+            tool calls -> registry (Pydantic validation) -> BookingClient
           re-check conversation state (the authoritative hard rule 7 read)
-          reserve the reply row WITH the generated text, commit
+          reserve the reply row WITH the generated text
+          record agent_runs + tool_executions (SAVEPOINT), commit
           send the STORED text via Meta, then save the wamid
 ```
 
@@ -37,8 +39,12 @@ audio message -> media id -> fetch media URL -> download -> transcribe
 
 ## Agent Core contract
 ```python
-process_turn(turn: Turn, chat: ChatClient) -> AgentResult
+process_turn(turn: Turn, chat: ChatClient, runtime: AgentRuntime) -> AgentResult
 ```
+
+`runtime` arrived in VS-006: it carries the `BookingClient`, the clock, the turn
+budget and the tool registry. Bundling them keeps this signature from growing a
+parameter per slice.
 `Turn` carries the five fields this contract always named — `tenant_id`,
 `contact_id`, `conversation_id`, `modality`, `input_text` — plus `history`, the
 earlier messages of the conversation as plain data.
@@ -52,9 +58,32 @@ imports no session, no repository and no model, and a test enforces it.
 never a retry, and a classified result rather than an exception. The OpenAI SDK
 lives behind it in exactly one module.
 
-AgentResult holds the reply text, the outcome and reason, the prompt version and
-the token counts. Tool calls arrive in VS-006 and the handoff flag in VS-010.
-It knows nothing about WhatsApp, so later calls/voice reuse it unchanged.
+AgentResult holds the reply text, the outcome and reason, the prompt version,
+the token counts, the number of model calls, and **the tool-call records** - as
+plain data, for the JOB to persist in T1b. `app/agent/` cannot open a
+transaction, which is why it returns them rather than writing them. The handoff
+flag arrives in VS-010. It knows nothing about WhatsApp, so later calls/voice
+reuse it unchanged.
+
+## The tool loop (VS-006)
+
+The model REQUESTS, our code EXECUTES. Each model call is given three read-only
+tools; the model may answer with text or ask for tools, and it never runs
+anything itself. Everything it asks for is untrusted input, exactly like a
+patient's message.
+
+```
+MAX_MODEL_CALLS            4      model calls per turn (a constant, not a setting)
+AGENT_TURN_TIMEOUT_SECONDS 45     ONE deadline around the whole loop
+OPENAI_TIMEOUT_SECONDS     30     one model call, INSIDE that budget
+```
+
+`tenant_id` reaches the tools through `ToolContext`, built by our code. It is in
+no schema, no argument, no result and no error (hard rule 4), and a `tenant_id`
+the model invents is refused by `extra="forbid"` and reported back.
+
+Every tool call the model asks for gets a `tool` message - OpenAI requires one
+per id - and a `tool_executions` row, executed or not.
 
 ## Conversation states
 AI_ACTIVE -> HUMAN_REQUESTED -> HUMAN_ACTIVE -> CLOSED
