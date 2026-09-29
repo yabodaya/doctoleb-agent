@@ -18,7 +18,7 @@ class Contact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "contacts"
     __table_args__ = (sa.Index("ix_contacts_tenant_id", "tenant_id"),)
 
-    tenant_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     # Patient content (hard rule 8): stored, never logged, never in a repr.
     display_name: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
 
@@ -40,7 +40,7 @@ class ContactIdentity(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         check_constraint("channel", Channel, "channel_valid"),
     )
 
-    tenant_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     contact_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, sa.ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False
     )

@@ -57,3 +57,22 @@ def test_the_worker_test_sessionmaker_matches_production(db_engine):
 
     for option in SESSION_OPTIONS:
         assert harness.kw[option] is production.kw[option], option
+
+
+@pytest.mark.db
+async def test_the_db_session_fixture_uses_the_shared_session_options(db_session):
+    """Q11. The fixture every repository test runs on must match production.
+
+    Before this, `db_session` set expire_on_commit=False by hand and left
+    autoflush at its default TRUE, while production runs with it off. A
+    repository method that relied on an implicit flush - emitting a SELECT and
+    getting a row it had only added to the session - passed here and would
+    return nothing live. The pins above cover the constant and the worker
+    factory; this covers the one fixture most tests actually use.
+    """
+    from app.db.session import SESSION_OPTIONS
+
+    # Read off the live session, not off the factory that built it: that is the
+    # state the repositories under test actually run against.
+    assert db_session.sync_session.autoflush is SESSION_OPTIONS["autoflush"]
+    assert db_session.sync_session.expire_on_commit is SESSION_OPTIONS["expire_on_commit"]

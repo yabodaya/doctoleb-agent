@@ -219,28 +219,62 @@ def test_the_retry_knobs_have_the_documented_defaults(monkeypatch):
     assert settings.job_backoff_max_seconds == 300.0
 
 
-def test_the_job_timeout_exceeds_the_openai_and_meta_timeouts_together(monkeypatch):
-    """A real constraint, not a tidy coincidence.
+def test_the_job_timeout_exceeds_the_turn_budget_and_the_meta_send_together(monkeypatch):
+    """A real constraint, not a tidy coincidence. Plan section 5.2's arithmetic:
 
-    The job now makes TWO network calls - the model, then Meta - so its budget
-    must cover both. An arq job that exceeds its timeout is finished as failed
-    and never retried, and none of our exit paths run: no dead letter, no lease
-    release, and nothing re-enqueues the event (verified against arq 0.28). The
+        MAX_MODEL_CALLS (a constant, not a setting)   4   model calls per turn
+        OPENAI_TIMEOUT_SECONDS                       30   ONE model call
+        AGENT_TURN_TIMEOUT_SECONDS                   45   the WHOLE tool loop
+        META_SEND_TIMEOUT_SECONDS                    10   the one Meta send
+        ---------------------------------------------------------------------
+        network worst case = 45 + 10                 55
+        JOB_TIMEOUT_SECONDS                          90   must be > 55
+        JOB_LEASE_MARGIN_SECONDS                     30
+        claim lease = 90 + 30                       120   > 90
+
+    OPENAI_TIMEOUT_SECONDS drops OUT of this relation in VS-006: every model
+    call now runs INSIDE the turn budget, so the loop, not the per-call
+    deadline, is what the job has to cover. Without the loop deadline the worst
+    case would be 4 x 30s of model calls plus the tools plus the send - 130s or
+    more - and JOB_TIMEOUT_SECONDS would have to exceed that.
+
+    Why it matters: an arq job that exceeds its timeout is finished as failed
+    and never retried, and none of our exit paths run - no dead letter, no lease
+    release, nothing re-enqueues the event (verified against arq 0.28). The
     event is simply stranded until its lease expires.
 
-    Both calls are bounded as wall-clock deadlines rather than as httpx
-    timeouts, because an httpx timeout is per connection phase and one call can
-    legitimately take several times its value: see OpenAIChatClient.complete
-    and MetaClient.send_text.
+    Both budgets are wall-clock deadlines rather than httpx timeouts, because an
+    httpx timeout is per connection phase and one call can legitimately take
+    several times its value.
     """
-    for key in ("JOB_TIMEOUT_SECONDS", "META_SEND_TIMEOUT_SECONDS", "OPENAI_TIMEOUT_SECONDS"):
+    for key in (
+        "JOB_TIMEOUT_SECONDS",
+        "META_SEND_TIMEOUT_SECONDS",
+        "AGENT_TURN_TIMEOUT_SECONDS",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     settings = _base_settings()
 
     assert settings.job_timeout_seconds > (
-        settings.openai_timeout_seconds + settings.meta_send_timeout_seconds
+        settings.agent_turn_timeout_seconds + settings.meta_send_timeout_seconds
     )
+
+
+def test_the_turn_budget_and_the_job_timeout_have_their_documented_defaults(monkeypatch):
+    """Decision D4 with Q4's numbers, pinned so a change is a visible decision.
+
+    45 seconds is what a patient waits at worst before the fallback; 90 leaves
+    35 seconds for the job's four transactions once the two network budgets are
+    subtracted. 40/60 was the alternative and leaves only 10.
+    """
+    for key in ("AGENT_TURN_TIMEOUT_SECONDS", "JOB_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(key, raising=False)
+
+    settings = _base_settings()
+
+    assert settings.agent_turn_timeout_seconds == 45.0
+    assert settings.job_timeout_seconds == 90.0
 
 
 def test_the_claim_lease_outlives_the_job_timeout(monkeypatch):
@@ -400,6 +434,10 @@ def test_the_app_boots_from_a_verbatim_copy_of_env_example(monkeypatch):
     assert settings.agent_history_messages == (
         Settings.model_fields["agent_history_messages"].default
     )
+    # VS-006's key, added blank to the example file like every other one.
+    assert settings.agent_turn_timeout_seconds == (
+        Settings.model_fields["agent_turn_timeout_seconds"].default
+    )
 
 
 def test_a_blank_numeric_value_means_unset(monkeypatch):
@@ -430,6 +468,7 @@ def test_a_blank_credential_stays_blank(monkeypatch):
     "override",
     [
         {"openai_timeout_seconds": 0},
+        {"agent_turn_timeout_seconds": 0},
         {"openai_max_output_tokens": 0},
         {"agent_history_messages": -1},
     ],

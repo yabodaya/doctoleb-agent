@@ -170,3 +170,113 @@ async def test_a_debug_run_of_the_openai_client_logs_nothing_it_should_not():
         and (record.name.startswith(("openai", "httpx2", "httpcore2")))
     ]
     assert noisy == []
+
+
+async def test_a_debug_run_with_tool_calls_logs_nothing_it_should_not():
+    """The same rule, now across a whole tool round trip (VS-006).
+
+    Tool calling adds three new ways content could reach a log line: the
+    ARGUMENTS the model writes (which can quote the patient), the RESULTS we
+    send back (clinic data, and in VS-011 clinic-configured free text), and an
+    unknown tool NAME, which is model-written too.
+
+    Two calls: one that asks for a tool with a sentinel name and sentinel
+    arguments, and one that sends a sentinel tool result back and gets a
+    sentinel reply.
+    """
+    sentinels = {
+        "SENTINEL-tool-arguments",
+        "SENTINELNAME-unknown-tool",
+        "SENTINEL-tool-result",
+        "SENTINEL-interim-text",
+        "SENTINEL-final-reply",
+        "sk-SENTINEL-not-a-real-key",
+    }
+    configure_logging("DEBUG")
+    collector = Collector()
+    logging.getLogger().addHandler(collector)
+    logging.getLogger("app.test").debug("positive control")  # as above
+
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pw@localhost:5432/doctoleb",
+        redis_url="redis://localhost:6379/0",
+        openai_api_key="sk-SENTINEL-not-a-real-key",
+        openai_chat_model="test-model",
+    )
+
+    def body(message: dict, finish: str) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1730000000,
+                "model": "test-model",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            },
+        )
+
+    responses = iter(
+        [
+            body(
+                {
+                    "role": "assistant",
+                    "content": "SENTINEL-interim-text",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "SENTINELNAME-unknown-tool",
+                                "arguments": '{"note":"SENTINEL-tool-arguments"}',
+                            },
+                        }
+                    ],
+                },
+                "tool_calls",
+            ),
+            body({"role": "assistant", "content": "SENTINEL-final-reply"}, "stop"),
+        ]
+    )
+
+    async def transport(request):
+        return next(responses)
+
+    from app.integrations.openai import ChatMessage, ToolSpec
+
+    client = OpenAIChatClient(
+        settings, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(transport))
+    )
+    tools = (
+        ToolSpec(
+            "list_doctors",
+            "List the clinic's doctors.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+    )
+    first = await client.complete([ChatMessage("user", "is Dr. Karim free?")], tools)
+    assert first.tool_calls[0].name == "SENTINELNAME-unknown-tool"
+
+    second = await client.complete(
+        [
+            ChatMessage("user", "is Dr. Karim free?"),
+            ChatMessage("assistant", first.text, tool_calls=first.tool_calls),
+            ChatMessage("tool", '{"error":"SENTINEL-tool-result"}', tool_call_id="call_1"),
+        ],
+        tools,
+    )
+    assert second.text == "SENTINEL-final-reply"
+
+    lines = [record.getMessage() for record in collector.records]
+    assert "positive control" in lines
+    for sentinel in sentinels:
+        assert not any(sentinel in line for line in lines), sentinel
+    noisy = [
+        record.name
+        for record in collector.records
+        if record.levelno < logging.WARNING
+        and (record.name.startswith(("openai", "httpx2", "httpcore2")))
+    ]
+    assert noisy == []

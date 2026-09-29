@@ -11,6 +11,16 @@ from app.integrations.openai.interface import (
     ChatOutcome,
     ChatResult,
     Role,
+    ToolCallRequest,
+    ToolSpec,
 )
 
-__all__ = ["ChatClient", "ChatMessage", "ChatOutcome", "ChatResult", "Role"]
+__all__ = [
+    "ChatClient",
+    "ChatMessage",
+    "ChatOutcome",
+    "ChatResult",
+    "Role",
+    "ToolCallRequest",
+    "ToolSpec",
+]

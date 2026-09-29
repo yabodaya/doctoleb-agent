@@ -9,18 +9,24 @@ genuinely independent connections, which the rollback-wrapped db_session cannot
 provide.
 """
 
+import datetime as dt
 import uuid
 from typing import Any
 
 import httpx
 import pytest
+from arq.worker import Retry
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.channels.whatsapp.client import MetaClient
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.db.models import WebhookInbox
-from app.db.session import SESSION_OPTIONS
-from app.tenants import ConfigTenantResolver
+from app.db.session import SESSION_OPTIONS, get_session
+from app.integrations.booking.fake import FakeBookingClient
+from app.main import create_app
+from app.queue import get_job_queue
+from app.tenants.resolver import ConfigTenantResolver
+from app.worker.jobs.inbox import process_inbox_event
 from tests.db import factories as f
 from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
     db_engine,
@@ -30,7 +36,17 @@ from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
     test_database_url,
 )
 from tests.integrations.fakes import FakeChatClient
-from tests.whatsapp_factories import PHONE_NUMBER_ID, contact, phone, text_message, wamid
+from tests.queue.fakes import FakeJobQueue
+from tests.whatsapp_factories import (
+    APP_SECRET,
+    PHONE_NUMBER_ID,
+    VERIFY_TOKEN,
+    contact,
+    phone,
+    signed,
+    text_message,
+    wamid,
+)
 
 ACCESS_TOKEN = "test-access-token-not-a-real-one"
 
@@ -155,8 +171,10 @@ async def clean_database(request, db_engine):  # noqa: F811
     async with db_engine.begin() as connection:
         await connection.execute(
             sa.text(
-                "TRUNCATE webhook_inbox, dead_letter_jobs, messages, "
-                "conversations, contact_identities, contacts"
+                # tool_executions before agent_runs is not strictly needed -
+                # one TRUNCATE handles the FK - but the order documents it.
+                "TRUNCATE tool_executions, agent_runs, webhook_inbox, "
+                "dead_letter_jobs, messages, conversations, contact_identities, contacts"
             )
         )
 
@@ -178,6 +196,16 @@ async def store_event(sessionmaker, payload: dict[str, Any], n: int = 1, **overr
         return row.id
 
 
+# Tuesday 29 September 2026, 10:00 clinic local. The same instant Task 9's
+# acceptance test freezes, so "tomorrow" is Wednesday the 30th and Dr. Karim's
+# afternoon is 14:00, 14:20, 15:40, 16:20.
+FROZEN = dt.datetime(2026, 9, 29, 7, tzinfo=dt.UTC)
+
+
+def FROZEN_CLOCK() -> dt.datetime:  # noqa: N802 - it is a clock, not a class
+    return FROZEN
+
+
 def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None, **overrides):
     """The arq ctx dict a job is called with."""
     settings = settings or worker_settings()
@@ -189,8 +217,94 @@ def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None
         # test can reach OpenAI. A test that cares passes chat=FakeChatClient(...)
         # or the real OpenAIChatClient over an httpx2.MockTransport.
         "chat": FakeChatClient(),
+        # VS-006: a FROZEN clock and the demo booking data by default, so every
+        # VS-004 and VS-005 test runs unchanged (FakeChatClient(ok()) asks for
+        # no tools) while a test that cares can pass a RecordingBooking.
+        "clock": FROZEN_CLOCK,
+        "booking": FakeBookingClient.demo(clock=FROZEN_CLOCK),
         "resolver": ConfigTenantResolver.from_settings(settings),
         "job_try": 1,
     }
     ctx.update(overrides)
     return ctx
+
+
+PATH = "/webhooks/whatsapp"
+
+
+def app_settings(**overrides) -> Settings:
+    """Settings for the whole path: real Meta fakes, and a mapped tenant."""
+    values = {
+        "app_env": "test",
+        "database_url": "postgresql+asyncpg://user:pw@localhost:5432/doctoleb",
+        "redis_url": "redis://localhost:6379/0",
+        "meta_app_secret": APP_SECRET,
+        "meta_verify_token": VERIFY_TOKEN,
+        "meta_access_token": ACCESS_TOKEN,
+        "meta_api_version": "v21.0",
+        "meta_api_base_url": "https://graph.facebook.com",
+        "whatsapp_tenant_map": f'{{"100000000000001": "{f.TENANT_A}"}}',
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+@pytest.fixture
+def pipeline(sessionmaker_for, client_for):
+    """A webhook client and a queue, both wired to the committing sessionmaker.
+
+    Deliberately NOT the `use_database` fixture: the whole point of these tests
+    is that the worker reads in a different transaction from the one the webhook
+    wrote in, which the rollback-wrapped session cannot express.
+    """
+    settings = app_settings()
+    app = create_app(settings)
+    queue = FakeJobQueue()
+
+    async def session_override():
+        async with sessionmaker_for() as session:
+            yield session
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_session] = session_override
+    app.dependency_overrides[get_job_queue] = lambda: queue
+
+    class Pipeline:
+        def __init__(self):
+            self.settings = settings
+            self.queue = queue
+            self.transport: Meta | None = None
+
+        async def post(self, body):
+            raw, headers = signed(body, secret=APP_SECRET)
+            async with client_for(app) as client:
+                return await client.post(PATH, content=raw, headers=headers)
+
+        async def drain(self, transport: Meta, expect_retry: bool = False, **ctx_overrides):
+            """Run a job for every id the webhook enqueued, in order.
+
+            `chat` defaults to job_context's FakeChatClient. Tests whose point is
+            the real classifier or the real request body pass an OpenAIChatClient
+            built on an httpx2.MockTransport instead; `settings` overrides the
+            job's settings without rebuilding the app, which only needs the Meta
+            and tenant halves that are identical either way.
+            """
+            job_settings = ctx_overrides.pop("settings", settings)
+            ctx = job_context(
+                sessionmaker_for,
+                meta_client(transport, job_settings),
+                job_settings,
+                **ctx_overrides,
+            )
+            outcomes = []
+            while self.queue.enqueued:
+                row_id = self.queue.enqueued.pop(0)
+                try:
+                    outcomes.append(await process_inbox_event(ctx, str(row_id)))
+                except Retry:
+                    if not expect_retry:
+                        raise
+                    outcomes.append("retry")
+            return outcomes
+
+    return Pipeline()

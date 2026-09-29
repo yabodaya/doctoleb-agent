@@ -1,10 +1,10 @@
 """Where jobs go when retrying stops being useful (hard rule 11)."""
 
-import uuid
 from typing import Any
 
 from app.db.models import DeadLetterJob
 from app.db.repositories.base import Repository
+from app.tenants.ids import TenantId
 
 
 class DeadLetterJobRepository(Repository):
@@ -17,7 +17,7 @@ class DeadLetterJobRepository(Repository):
         payload: dict[str, Any],
         error: str,
         attempts: int,
-        tenant_id: uuid.UUID | None = None,
+        tenant_id: TenantId | None = None,
         source_event_id: str | None = None,
     ) -> DeadLetterJob:
         job = DeadLetterJob(

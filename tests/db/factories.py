@@ -10,17 +10,31 @@ import uuid
 from typing import Any
 
 from app.db.enums import (
+    AgentRunOutcome,
     Channel,
     ConversationState,
     InboxStatus,
     MessageDirection,
     MessageModality,
     MessageStatus,
+    ToolExecutionStatus,
 )
-from app.db.models import Contact, ContactIdentity, Conversation, Message, WebhookInbox
+from app.db.models import (
+    AgentRun,
+    Contact,
+    ContactIdentity,
+    Conversation,
+    Message,
+    ToolExecution,
+    WebhookInbox,
+)
+from app.tenants.ids import TenantId
 
-TENANT_A = uuid.UUID("00000000-0000-4000-8000-00000000000a")
-TENANT_B = uuid.UUID("00000000-0000-4000-8000-00000000000b")
+# Deliberately NOT UUIDs (decision D1): a tenant id is an opaque string, and
+# test data that looks like a UUID would let a quiet uuid.UUID(...) parse
+# survive anywhere in the stack.
+TENANT_A: TenantId = "clinic-alpha"
+TENANT_B: TenantId = "clinic-beta"
 
 # PostgreSQL's now() is the TRANSACTION start time, constant for a whole test.
 # Any assertion that a timestamp column moved needs the column set to a fixed
@@ -52,14 +66,14 @@ def make_inbox(n: int, **overrides: Any) -> WebhookInbox:
     return WebhookInbox(**values)
 
 
-def make_contact(tenant_id: uuid.UUID = TENANT_A, **overrides: Any) -> Contact:
+def make_contact(tenant_id: TenantId = TENANT_A, **overrides: Any) -> Contact:
     values: dict[str, Any] = {"tenant_id": tenant_id, "display_name": "Test Patient"}
     values.update(overrides)
     return Contact(**values)
 
 
 def make_identity(
-    contact: Contact, n: int = 1, tenant_id: uuid.UUID | None = None, **overrides: Any
+    contact: Contact, n: int = 1, tenant_id: TenantId | None = None, **overrides: Any
 ) -> ContactIdentity:
     values: dict[str, Any] = {
         "tenant_id": tenant_id or contact.tenant_id,
@@ -112,3 +126,41 @@ def make_reply(conversation: Conversation, inbound: Message, **overrides: Any) -
     }
     values.update(overrides)
     return Message(**values)
+
+
+def make_agent_run(conversation: Conversation, inbound: Message, **overrides: Any) -> AgentRun:
+    """A recorded turn. Codes, counts and ids only - there is nothing else to
+    put here, which is the point of the table."""
+    values: dict[str, Any] = {
+        "tenant_id": conversation.tenant_id,
+        "inbox_event_id": uuid.uuid4(),
+        "conversation_id": conversation.id,
+        "inbound_message_id": inbound.id,
+        "job_try": 1,
+        "model": "test-model",
+        "prompt_version": "vs006-1",
+        "outcome": AgentRunOutcome.SUCCESS.value,
+        "reason": "ok",
+        "model_calls": 1,
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "duration_ms": 123,
+    }
+    values.update(overrides)
+    return AgentRun(**values)
+
+
+def make_tool_execution(run: AgentRun, sequence: int = 0, **overrides: Any) -> ToolExecution:
+    values: dict[str, Any] = {
+        "agent_run_id": run.id,
+        "tenant_id": run.tenant_id,
+        "sequence": sequence,
+        "model_call": 1,
+        "tool_name": "list_doctors",
+        "argument_names": [],
+        "status": ToolExecutionStatus.OK.value,
+        "error_code": None,
+        "duration_ms": 4,
+    }
+    values.update(overrides)
+    return ToolExecution(**values)

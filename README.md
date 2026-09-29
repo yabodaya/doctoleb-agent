@@ -199,6 +199,49 @@ two different things went wrong, and each has a different fix.
 Token counts and the prompt version are on the `reply generated` line. Never
 paste a prompt or a reply into an issue.
 
+### Tools (VS-006)
+
+The model can now **look things up** before it answers. It never runs anything
+itself: it asks for a tool by name, our code validates the arguments and decides
+what actually runs, against which clinic.
+
+**The three tools**, all read-only:
+
+| Tool | What it returns |
+|---|---|
+| `get_clinic_information` | name, address, opening hours (closed days marked), policies |
+| `list_doctors` | each doctor's `doctor_id`, name, specialty and services |
+| `search_available_slots` | one doctor's free times between two clinic-local datetimes |
+
+The model must call `list_doctors` first: `search_available_slots` takes a
+`doctor_id` and does no name lookup, so it cannot invent a doctor.
+
+> **The booking data is FAKE.** VS-006 ships an in-memory demo clinic -
+> "Doctoleb Demo Clinic", 1 Demo Street, Dr. Karim Haddad - and the worker says
+> so on every start (`booking service is the in-memory FAKE`). **Never put this
+> worker in front of real patients.** VS-011 connects the real Booking Service.
+
+**The clock message.** The date is deliberately NOT in the system prompt (the
+prompt's SHA-256 is pinned to its version, and a prompt that changed daily could
+not be pinned). Instead each turn carries a separate `system` message with the
+clinic's current date and time in **Asia/Beirut**, tomorrow's date, and the next
+seven dates with weekday names. `tzdata` is a runtime dependency because Windows
+hosts have no system time zone database.
+
+**The limits.** One turn makes at most **4 model calls** and runs under one
+deadline, `AGENT_TURN_TIMEOUT_SECONDS` (default 45). Four is three for the
+normal flow - list, search, answer - plus one for a single self-correction after
+an invalid-arguments error. `JOB_TIMEOUT_SECONDS` rose **60 → 90** to cover the
+turn plus the Meta send (45 + 10 = 55), which puts the claim lease at 120s.
+
+**New dead-letter reasons**, all `replied_fallback` (the patient WAS answered):
+
+| Reason | What it means |
+|---|---|
+| `agent_max_model_calls` | the model still wanted tools on its 4th call. Permanent — a retry would loop the same way. |
+| `agent_turn_timeout` | the whole turn passed `AGENT_TURN_TIMEOUT_SECONDS`. Retried with backoff; falls back on the last try. |
+| `agent_tool_crashed` | a bug in our tool code. The dead letter carries the exception class name only. |
+
 ### Reading the tables
 
 **Take the database credentials from `docker-compose.yml` and `.env`** rather than
@@ -217,6 +260,19 @@ docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select
 docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select direction, modality, status, provider_message_id is not null as has_wamid, reply_to_message_id is not null as is_reply from messages order by created_at desc limit 10;"
 docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select job_name, source_event_id, error, attempts, created_at from dead_letter_jobs order by created_at desc limit 10;"
 ```
+
+**What each turn cost, and which tools it called** (VS-006). Both tables hold
+codes, counts and ids only — by design, so they are safe to open casually:
+
+```powershell
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select created_at, outcome, reason, model_calls, prompt_tokens, completion_tokens, duration_ms from agent_runs order by created_at desc limit 12;"
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select r.created_at, t.sequence, t.model_call, t.tool_name, t.argument_names, t.status, t.error_code, t.duration_ms from tool_executions t join agent_runs r on r.id = t.agent_run_id order by r.created_at desc, t.sequence limit 30;"
+```
+
+A `tool_name` of `unknown` means the model named a tool that does not exist: the
+name it wrote is never stored, because it is model-written text.
+`argument_names` holds the names of arguments **we declared** that were present —
+never their values, and never a key the model invented.
 
 **Select ids, statuses and reason codes. Never `payload`, never `text`, never
 `provider_event_id`, and never paste a prompt or a generated reply into an
@@ -248,3 +304,7 @@ once the lease expires (`JOB_TIMEOUT_SECONDS + JOB_LEASE_MARGIN_SECONDS`).
 | `retrying … reason=openai_http_429` or `openai_timeout` | OpenAI is rate-limiting or slow. Retried with backoff; the fifth failure falls back. |
 | `retrying … reason=http_timeout` | the Meta send passed `META_SEND_TIMEOUT_SECONDS`. Meta may still have accepted it. |
 | `dropped_not_ai_active` with no `reply generated` line | a human held the conversation before the job started: the model was not called. |
+| `replied_fallback` + `agent_max_model_calls` | the model kept asking for tools. Look at that run's `tool_executions`: a repeated `INVALID_ARGUMENTS` usually means a tool description needs work. |
+| `replied_fallback` + `agent_turn_timeout` | the whole turn was too slow. `agent_runs.duration_ms` and `model_calls` say where it went. |
+| `replied_fallback` + `agent_tool_crashed` | a bug in our tool code. The dead letter names the exception class; the `tool_executions` row names the tool. |
+| a reply naming times the clinic does not have | the booking data is the **fake** (see the warning above), not a real schedule. |

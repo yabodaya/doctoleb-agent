@@ -13,12 +13,14 @@ from sqlalchemy.orm.attributes import instance_state
 
 from app.db.base import NAMING_CONVENTION, Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.db.enums import (
+    AgentRunOutcome,
     Channel,
     ConversationState,
     InboxStatus,
     MessageDirection,
     MessageModality,
     MessageStatus,
+    ToolExecutionStatus,
     check_constraint,
 )
 
@@ -34,12 +36,16 @@ class _SampleBase(DeclarativeBase):
     __repr__ = Base.__repr__
 
 
+TENANT = "clinic-alpha"  # opaque (decision D1), never a UUID
+
+
 class _Sample(UUIDPrimaryKeyMixin, TimestampMixin, _SampleBase):
     """A throwaway model used only to exercise the mixins."""
 
     __tablename__ = "_sample"
 
-    tenant_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    # sa.Text, matching every real tenant column since decision D1.
+    tenant_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     secret_text: Mapped[str | None] = mapped_column(sa.Text)
 
 
@@ -72,6 +78,32 @@ def test_enum_values_are_the_exact_strings_stored_in_the_database():
         "FAILED",
     ]
     assert [c.value for c in Channel] == ["whatsapp"]
+    # VS-006.
+    assert [o.value for o in AgentRunOutcome] == ["SUCCESS", "RETRYABLE", "PERMANENT"]
+    assert [s.value for s in ToolExecutionStatus] == [
+        "OK",
+        "INVALID_ARGUMENTS",
+        "UNKNOWN_TOOL",
+        "ERROR",
+        # A call the model asked for on the last allowed model response, or past
+        # the per-turn cap: recorded, never executed. The model still gets a
+        # tool message for it, because OpenAI requires one per tool_call_id.
+        "SKIPPED",
+    ]
+
+
+def test_agent_run_outcomes_are_the_chat_outcomes():
+    """The database's vocabulary and the chat layer's must not drift.
+
+    They are separate enums on purpose - app/db/ must not import the
+    integrations layer - which is exactly why they need a test. If ChatOutcome
+    ever grows a value, this fails, and widening the CHECK becomes a decision
+    with a migration rather than a row PostgreSQL rejects inside a job.
+    """
+    from app.integrations.openai import ChatOutcome
+
+    assert [o.value for o in AgentRunOutcome] == [o.value for o in ChatOutcome]
+    assert {o.name for o in AgentRunOutcome} == {o.name for o in ChatOutcome}
 
 
 def test_enums_are_plain_strings_so_they_bind_to_varchar_columns():
@@ -104,16 +136,16 @@ def test_uuid_primary_key_is_assigned_at_construction():
     # and child rows in one go (a contact and its identity, a conversation and
     # its messages) and reads the parent's id before any flush, so the id has
     # to exist the moment the object does.
-    row = _Sample(tenant_id=uuid4())
+    row = _Sample(tenant_id=TENANT)
     assert isinstance(row.id, UUID)
     assert _Sample.__table__.c.id.primary_key is True
 
     # An explicitly supplied id must survive.
     fixed = uuid4()
-    assert _Sample(id=fixed, tenant_id=uuid4()).id == fixed
+    assert _Sample(id=fixed, tenant_id=TENANT).id == fixed
 
     # Two rows do not share one.
-    assert _Sample(tenant_id=uuid4()).id != _Sample(tenant_id=uuid4()).id
+    assert _Sample(tenant_id=TENANT).id != _Sample(tenant_id=TENANT).id
 
 
 def test_timestamps_are_timezone_aware_with_a_server_default():
@@ -131,7 +163,7 @@ def test_timestamps_are_timezone_aware_with_a_server_default():
 
 def test_repr_never_includes_column_content():
     # Hard rule 8. These objects appear in tracebacks and assertion failures.
-    row = _Sample(tenant_id=uuid4(), secret_text="my knee hurts")
+    row = _Sample(tenant_id=TENANT, secret_text="my knee hurts")
     rendered = repr(row)
     assert "my knee hurts" not in rendered
     assert "_Sample" in rendered
@@ -146,7 +178,7 @@ def test_repr_on_an_expired_instance_does_not_trigger_attribute_loading():
     # the expired loader. Under AsyncSession that raises MissingGreenlet --
     # while an exception is being formatted, which hides the original error.
     # __repr__ must therefore read only already-loaded values.
-    row = _Sample(tenant_id=uuid4(), secret_text="my knee hurts")
+    row = _Sample(tenant_id=TENANT, secret_text="my knee hurts")
     state = instance_state(row)
     state._expire(row.__dict__, set())
     assert state.expired is True

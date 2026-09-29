@@ -13,12 +13,14 @@ import httpx
 from arq.connections import RedisSettings
 from arq.worker import func
 
+from app.agent import utc_now
 from app.channels.whatsapp.client import MetaClient
 from app.config import Settings, get_settings
 from app.db.session import dispose_engine, get_sessionmaker
+from app.integrations.booking.fake import FakeBookingClient
 from app.integrations.openai.chat import OpenAIChatClient
 from app.logging_config import configure_logging
-from app.tenants import ConfigTenantResolver
+from app.tenants.resolver import ConfigTenantResolver
 from app.worker.jobs import process_inbox_event
 
 logger = logging.getLogger(__name__)
@@ -52,14 +54,27 @@ def startup_warnings(settings: Settings) -> list[str]:
         warnings.append("OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY")
     if not settings.openai_chat_model.strip():
         warnings.append("OPENAI_CHAT_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY")
-    budget = settings.openai_timeout_seconds + settings.meta_send_timeout_seconds
+    # Decision D4: the job must cover the WHOLE tool loop plus the one send.
+    # OPENAI_TIMEOUT_SECONDS is deliberately not in this sum - it bounds one
+    # model call, and every model call happens inside the turn budget. Naming it
+    # here would point an operator at the wrong knob.
+    budget = settings.agent_turn_timeout_seconds + settings.meta_send_timeout_seconds
     if settings.job_timeout_seconds <= budget:
         warnings.append(
             f"JOB_TIMEOUT_SECONDS={settings.job_timeout_seconds:g} does not exceed "
-            f"OPENAI_TIMEOUT_SECONDS={settings.openai_timeout_seconds:g} + "
+            f"AGENT_TURN_TIMEOUT_SECONDS={settings.agent_turn_timeout_seconds:g} + "
             f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g}: "
             "a slow reply can be cut off mid-send"
         )
+    # Q8, and risk R8: the real danger in this slice is fake availability
+    # reaching a real patient. VS-011 adds the BOOKING_CLIENT switch and the
+    # refusal to start in production; until then this line, on every worker
+    # start, is the whole of the mitigation - with clearly fake names and a
+    # fictional address behind it.
+    warnings.append(
+        "booking service is the in-memory FAKE (VS-006): availability answers are demo "
+        "data - never put this worker in front of real patients"
+    )
     return warnings
 
 
@@ -88,6 +103,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     # without a key: it reports openai_api_key_unset instead of failing to
     # construct, so the worker boots with no OpenAI account at all.
     ctx["chat"] = OpenAIChatClient(settings)
+    # VS-006. The clock is injected so nothing below reads the wall clock
+    # directly, and the booking client is the in-memory FAKE - see the warning
+    # in startup_warnings().
+    ctx["clock"] = utc_now
+    ctx["booking"] = FakeBookingClient.demo(clock=utc_now)
     ctx["resolver"] = ConfigTenantResolver.from_settings(settings)
     logger.info("worker started")
 

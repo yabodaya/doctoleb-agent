@@ -631,7 +631,13 @@ async def test_a_text_message_is_answered_with_the_generated_text(sessionmaker_f
 async def test_the_model_sees_the_system_prompt_then_the_history_then_the_new_message(
     sessionmaker_for,
 ):
-    """Requirement 5, at the job level: roles, order, and the answered message last."""
+    """Requirement 5, at the job level: roles, order, and the answered message last.
+
+    VS-006 inserted the clock message (a `system` turn) between the history and
+    the message being answered - decision D3, plan conflict C12. The expected
+    list below changed deliberately; tests/agent/test_tool_loop.py explains why
+    it sits there rather than next to the prompt.
+    """
     transport = Meta(ok_response(8), ok_response(9))
     settings = worker_settings()
     chat = FakeChatClient(ok())
@@ -647,9 +653,11 @@ async def test_the_model_sees_the_system_prompt_then_the_history_then_the_new_me
     )
 
     second = chat.calls[1]
-    assert [m.role for m in second] == ["system", "user", "assistant", "user"]
+    assert [m.role for m in second] == ["system", "user", "assistant", "system", "user"]
     assert second[0].content.startswith("You are the WhatsApp receptionist")
-    assert [m.content for m in second[1:]] == [PATIENT_TEXT, AI_REPLY, "and one more thing"]
+    assert [m.content for m in second[1:3]] == [PATIENT_TEXT, AI_REPLY]
+    assert second[3].content.startswith("Current date and time at the clinic")
+    assert second[4].content == "and one more thing"
 
 
 async def test_a_failed_reply_is_left_out_of_the_history(sessionmaker_for):
@@ -670,7 +678,9 @@ async def test_a_failed_reply_is_left_out_of_the_history(sessionmaker_for):
     )
 
     second = chat.calls[1]
-    assert [m.role for m in second] == ["system", "user", "user"]
+    # system prompt, the earlier patient message, the clock (VS-006, D3), then
+    # the new message. The failed reply is absent, which is the point.
+    assert [m.role for m in second] == ["system", "user", "system", "user"]
     assert AI_REPLY not in [m.content for m in second]
 
 
@@ -956,7 +966,7 @@ async def test_the_generation_log_line_carries_codes_counts_and_the_row_id_only(
         f"event_id={event_id}",
         "outcome=SUCCESS",
         "reason=ok",
-        "prompt_version=vs005-1",
+        "prompt_version=vs006-1",
         "prompt_tokens=11",
         "completion_tokens=7",
     ):

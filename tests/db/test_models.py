@@ -4,11 +4,13 @@ import sqlalchemy as sa
 
 from app.db.base import Base
 from app.db.models import (
+    AgentRun,
     Contact,
     ContactIdentity,
     Conversation,
     DeadLetterJob,
     Message,
+    ToolExecution,
     WebhookInbox,
 )
 
@@ -19,6 +21,8 @@ ALL_MODELS = [
     Conversation,
     Message,
     DeadLetterJob,
+    AgentRun,
+    ToolExecution,
 ]
 
 
@@ -44,6 +48,10 @@ def test_the_slice_creates_exactly_these_tables():
         "conversations",
         "messages",
         "dead_letter_jobs",
+        # VS-006. Both hold codes, counts and ids only - never a clinic's
+        # doctors, services or slots, which belong to the Booking Service.
+        "agent_runs",
+        "tool_executions",
     }
 
 
@@ -82,7 +90,7 @@ def test_tenant_id_is_not_null_everywhere_a_tenant_is_knowable():
     # Review Focus 7. The webhook stores the raw event before anything resolves
     # a tenant (hard rule 1), and a dead-lettered job may have died before
     # resolution, so those two are nullable. Everything else is not.
-    for model in (Contact, ContactIdentity, Conversation, Message):
+    for model in (Contact, ContactIdentity, Conversation, Message, AgentRun, ToolExecution):
         assert model.__table__.c.tenant_id.nullable is False, model.__tablename__
     assert WebhookInbox.__table__.c.tenant_id.nullable is True
     assert DeadLetterJob.__table__.c.tenant_id.nullable is True
@@ -167,3 +175,97 @@ def test_status_rank_covers_every_message_status():
     # FAILED overwrites SENT but never DELIVERED: a delivered message did not fail.
     assert STATUS_RANK[MessageStatus.SENT] < STATUS_RANK[MessageStatus.FAILED]
     assert STATUS_RANK[MessageStatus.FAILED] < STATUS_RANK[MessageStatus.DELIVERED]
+
+
+def test_the_agent_tables_have_exactly_these_columns():
+    """Hard rule 8, pinned as a column set rather than as a rule.
+
+    `agent_runs` and `tool_executions` exist to answer "what did this cost?"
+    and "why did that turn fail?" without becoming a second copy of the
+    conversation. Nothing here may hold content: no patient text, no model text,
+    no tool arguments, no tool results, no doctor names, no slot times, no
+    OpenAI tool-call ids, no unknown tool name and no undeclared argument name.
+
+    Asserted as an exact SET, so adding a `result` or an `arguments` column
+    means consciously editing this test. That deliberate edit is the whole
+    control: a reviewer sees the rule being changed, not a column being added.
+    """
+    assert set(AgentRun.__table__.c.keys()) == {
+        "id",
+        "created_at",
+        "updated_at",
+        "tenant_id",
+        "inbox_event_id",
+        "conversation_id",
+        "inbound_message_id",
+        "reply_message_id",
+        "job_try",
+        "model",
+        "prompt_version",
+        "outcome",
+        "reason",
+        "model_calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "duration_ms",
+    }
+    assert set(ToolExecution.__table__.c.keys()) == {
+        "id",
+        "created_at",
+        "updated_at",
+        "agent_run_id",
+        "tenant_id",
+        "sequence",
+        "model_call",
+        "tool_name",
+        "argument_names",
+        "status",
+        "error_code",
+        "duration_ms",
+    }
+
+
+def test_the_agent_tables_have_no_free_text_column():
+    """A second lock on the same rule, from the other direction.
+
+    The set above says which columns exist; this says what they may be. Every
+    column is an id, an integer, a timestamp, a short VARCHAR code, or the
+    TEXT[] of declared argument names. A `sa.Text` column - the shape that could
+    hold a message - exists only for `tenant_id`, which is a clinic identifier.
+    """
+    # sa.Text IS a subclass of sa.String, so "unbounded" is `length is None`,
+    # not the class.
+    for model in (AgentRun, ToolExecution):
+        for column in model.__table__.columns:
+            if not isinstance(column.type, sa.String):
+                continue
+            where = f"{model.__tablename__}.{column.name}"
+            if column.type.length is None:
+                assert column.name == "tenant_id", f"{where} is unbounded TEXT"
+            else:
+                assert column.type.length <= 100, where
+
+
+def test_a_tool_execution_belongs_to_a_run_and_dies_with_it():
+    """The FK is ON DELETE CASCADE, so no tool row can outlive its run.
+
+    Without the cascade, deleting a run under a retention policy would leave
+    orphan rows that no query scopes and nothing prunes.
+    """
+    (foreign_key,) = list(ToolExecution.__table__.c.agent_run_id.foreign_keys)
+
+    assert foreign_key.column is AgentRun.__table__.c.id
+    assert foreign_key.ondelete == "CASCADE"
+    assert frozenset(["agent_run_id", "sequence"]) in _unique_column_sets(ToolExecution.__table__)
+
+
+def test_the_declared_argument_names_column_has_no_server_default():
+    """An empty list must be WRITTEN, never defaulted into existence.
+
+    A server default would make "this tool call had no arguments" and "nobody
+    recorded the arguments" the same row.
+    """
+    column = ToolExecution.__table__.c.argument_names
+
+    assert column.server_default is None
+    assert column.nullable is False
