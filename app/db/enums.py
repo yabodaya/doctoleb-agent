@@ -90,3 +90,34 @@ def check_constraint(column: str, enum_cls: type[StrEnum], name: str) -> sa.Chec
     """
     values = ", ".join(f"'{member.value}'" for member in enum_cls)
     return sa.CheckConstraint(f"{column} IN ({values})", name=name)
+
+
+class AgentRunOutcome(StrEnum):
+    """How one generated turn ended (VS-006).
+
+    Deliberately the same three values as `ChatOutcome` in
+    `app/integrations/openai/interface.py`, and a test keeps them equal. They
+    are a separate enum rather than an import because `app/db/` must not depend
+    on the integrations layer, and because these strings are row contents: if
+    ChatOutcome ever grows a value, that is a CHECK migration, and the test is
+    what makes it a decision instead of a surprise.
+    """
+
+    SUCCESS = "SUCCESS"
+    RETRYABLE = "RETRYABLE"
+    PERMANENT = "PERMANENT"
+
+
+class ToolExecutionStatus(StrEnum):
+    """What happened to one tool call the model asked for (VS-006).
+
+    Every call the model made gets a row, executed or not, which is why SKIPPED
+    exists: calls arriving on the last allowed model response, or past the
+    per-turn cap, are recorded and not run.
+    """
+
+    OK = "OK"
+    INVALID_ARGUMENTS = "INVALID_ARGUMENTS"  # Pydantic refused them, or they were not JSON
+    UNKNOWN_TOOL = "UNKNOWN_TOOL"  # the model named a tool that is not registered
+    ERROR = "ERROR"  # the tool ran and failed (booking error, crash, deadline)
+    SKIPPED = "SKIPPED"  # recorded but never executed

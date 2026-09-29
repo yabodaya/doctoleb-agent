@@ -32,6 +32,8 @@ EXPECTED_TABLES = {
     "conversations",
     "messages",
     "dead_letter_jobs",
+    "agent_runs",
+    "tool_executions",
     "alembic_version",
 }
 

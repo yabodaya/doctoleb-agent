@@ -71,3 +71,21 @@ def as_duplicate(error: IntegrityError) -> DuplicateRecordError:
     driver_error = _driver_error(error)
     constraint = getattr(driver_error, "constraint_name", None) or "unknown constraint"
     return DuplicateRecordError(constraint)
+
+
+class RunNotRecordedError(RepositoryError):
+    """Recording an agent run and its tool executions failed (VS-006).
+
+    Carries the exception CLASS name and nothing else, and is raised `from None`
+    so no chained traceback survives. The engine runs with hide_parameters=True,
+    but a chained traceback would still print the statement, and a statement is
+    the wrong place to look for a leak from a table designed to hold no content.
+
+    It is a distinct type because the caller's reaction is specific: bookkeeping
+    that fails is logged and rolled back inside its own SAVEPOINT, and the
+    patient's reply still goes out.
+    """
+
+    def __init__(self, error_class: str) -> None:
+        self.error_class = error_class
+        super().__init__(f"agent run not recorded: {error_class}")

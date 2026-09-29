@@ -13,12 +13,14 @@ from sqlalchemy.orm.attributes import instance_state
 
 from app.db.base import NAMING_CONVENTION, Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.db.enums import (
+    AgentRunOutcome,
     Channel,
     ConversationState,
     InboxStatus,
     MessageDirection,
     MessageModality,
     MessageStatus,
+    ToolExecutionStatus,
     check_constraint,
 )
 
@@ -76,6 +78,32 @@ def test_enum_values_are_the_exact_strings_stored_in_the_database():
         "FAILED",
     ]
     assert [c.value for c in Channel] == ["whatsapp"]
+    # VS-006.
+    assert [o.value for o in AgentRunOutcome] == ["SUCCESS", "RETRYABLE", "PERMANENT"]
+    assert [s.value for s in ToolExecutionStatus] == [
+        "OK",
+        "INVALID_ARGUMENTS",
+        "UNKNOWN_TOOL",
+        "ERROR",
+        # A call the model asked for on the last allowed model response, or past
+        # the per-turn cap: recorded, never executed. The model still gets a
+        # tool message for it, because OpenAI requires one per tool_call_id.
+        "SKIPPED",
+    ]
+
+
+def test_agent_run_outcomes_are_the_chat_outcomes():
+    """The database's vocabulary and the chat layer's must not drift.
+
+    They are separate enums on purpose - app/db/ must not import the
+    integrations layer - which is exactly why they need a test. If ChatOutcome
+    ever grows a value, this fails, and widening the CHECK becomes a decision
+    with a migration rather than a row PostgreSQL rejects inside a job.
+    """
+    from app.integrations.openai import ChatOutcome
+
+    assert [o.value for o in AgentRunOutcome] == [o.value for o in ChatOutcome]
+    assert {o.name for o in AgentRunOutcome} == {o.name for o in ChatOutcome}
 
 
 def test_enums_are_plain_strings_so_they_bind_to_varchar_columns():

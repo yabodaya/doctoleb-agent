@@ -6,17 +6,28 @@ traced to a person.
 """
 
 import datetime as dt
+import uuid
 from typing import Any
 
 from app.db.enums import (
+    AgentRunOutcome,
     Channel,
     ConversationState,
     InboxStatus,
     MessageDirection,
     MessageModality,
     MessageStatus,
+    ToolExecutionStatus,
 )
-from app.db.models import Contact, ContactIdentity, Conversation, Message, WebhookInbox
+from app.db.models import (
+    AgentRun,
+    Contact,
+    ContactIdentity,
+    Conversation,
+    Message,
+    ToolExecution,
+    WebhookInbox,
+)
 from app.tenants import TenantId
 
 # Deliberately NOT UUIDs (decision D1): a tenant id is an opaque string, and
@@ -115,3 +126,41 @@ def make_reply(conversation: Conversation, inbound: Message, **overrides: Any) -
     }
     values.update(overrides)
     return Message(**values)
+
+
+def make_agent_run(conversation: Conversation, inbound: Message, **overrides: Any) -> AgentRun:
+    """A recorded turn. Codes, counts and ids only - there is nothing else to
+    put here, which is the point of the table."""
+    values: dict[str, Any] = {
+        "tenant_id": conversation.tenant_id,
+        "inbox_event_id": uuid.uuid4(),
+        "conversation_id": conversation.id,
+        "inbound_message_id": inbound.id,
+        "job_try": 1,
+        "model": "test-model",
+        "prompt_version": "vs006-1",
+        "outcome": AgentRunOutcome.SUCCESS.value,
+        "reason": "ok",
+        "model_calls": 1,
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "duration_ms": 123,
+    }
+    values.update(overrides)
+    return AgentRun(**values)
+
+
+def make_tool_execution(run: AgentRun, sequence: int = 0, **overrides: Any) -> ToolExecution:
+    values: dict[str, Any] = {
+        "agent_run_id": run.id,
+        "tenant_id": run.tenant_id,
+        "sequence": sequence,
+        "model_call": 1,
+        "tool_name": "list_doctors",
+        "argument_names": [],
+        "status": ToolExecutionStatus.OK.value,
+        "error_code": None,
+        "duration_ms": 4,
+    }
+    values.update(overrides)
+    return ToolExecution(**values)

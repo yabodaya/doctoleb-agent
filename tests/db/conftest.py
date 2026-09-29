@@ -22,6 +22,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.db.session import SESSION_OPTIONS
+
 TEST_DATABASE_NAME = "doctoleb_test"
 
 
@@ -115,10 +117,14 @@ async def db_session(db_engine) -> AsyncIterator[AsyncSession]:
     """
     async with db_engine.connect() as connection:
         transaction = await connection.begin()
+        # **SESSION_OPTIONS, not a hand-written expire_on_commit (Q11): the
+        # harness must use the SAME options as production. It previously left
+        # autoflush ON while the app runs with it off, so a repository that
+        # silently relied on an implicit flush passed here and would fail live.
         factory = async_sessionmaker(
             bind=connection,
-            expire_on_commit=False,
             join_transaction_mode="create_savepoint",
+            **SESSION_OPTIONS,
         )
         session = factory()
         try:
@@ -136,4 +142,4 @@ def second_session_factory(db_engine):
     uncommitted rows, which the rollback-wrapped db_session cannot provide.
     Tests using this clean up after themselves.
     """
-    return async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    return async_sessionmaker(bind=db_engine, **SESSION_OPTIONS)

@@ -9,7 +9,14 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from app.db.enums import ConversationState
-from app.db.models import Contact, Conversation, Message, WebhookInbox
+from app.db.models import (
+    AgentRun,
+    Contact,
+    Conversation,
+    Message,
+    ToolExecution,
+    WebhookInbox,
+)
 from tests.db import factories as f
 
 pytestmark = pytest.mark.db
@@ -294,3 +301,117 @@ async def test_many_messages_can_have_a_null_reply_link(db_session):
         sa.select(sa.func.count()).select_from(Message).where(Message.reply_to_message_id.is_(None))
     )
     assert count == 3
+
+
+async def _run_with_tools(db_session, **run_overrides):
+    """A committed-enough contact, conversation, message and agent run."""
+    contact = f.make_contact()
+    db_session.add(contact)
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    inbound = f.make_message(conversation)
+    db_session.add(inbound)
+    run = f.make_agent_run(conversation, inbound, **run_overrides)
+    db_session.add(run)
+    await db_session.flush()
+    return run
+
+
+async def test_an_unknown_run_outcome_is_rejected(db_session):
+    # The same reasoning as the conversation-state test above: autogenerate
+    # never compares CHECK constraints, so this is the only thing standing
+    # between AgentRunOutcome and ChatOutcome silently drifting apart.
+    contact = f.make_contact()
+    db_session.add(contact)
+    conversation = f.make_conversation(contact)
+    db_session.add(conversation)
+    inbound = f.make_message(conversation)
+    db_session.add(inbound)
+    await db_session.flush()
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            sa.insert(AgentRun).values(
+                id=uuid.uuid4(),
+                tenant_id=conversation.tenant_id,
+                inbox_event_id=uuid.uuid4(),
+                conversation_id=conversation.id,
+                inbound_message_id=inbound.id,
+                job_try=1,
+                prompt_version="vs006-1",
+                outcome="BANANA",
+                reason="ok",
+                model_calls=1,
+                duration_ms=1,
+            )
+        )
+
+
+async def test_an_unknown_tool_status_is_rejected(db_session):
+    run = await _run_with_tools(db_session)
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            sa.insert(ToolExecution).values(
+                id=uuid.uuid4(),
+                agent_run_id=run.id,
+                tenant_id=run.tenant_id,
+                sequence=0,
+                model_call=1,
+                tool_name="list_doctors",
+                argument_names=[],
+                status="BANANA",
+                duration_ms=1,
+            )
+        )
+
+
+async def test_a_tool_execution_needs_its_run(db_session):
+    # Without the foreign key, a bookkeeping bug could leave tool rows that no
+    # run explains and no tenant query reaches.
+    db_session.add(
+        ToolExecution(
+            agent_run_id=uuid.uuid4(),
+            tenant_id=f.TENANT_A,
+            sequence=0,
+            model_call=1,
+            tool_name="list_doctors",
+            argument_names=[],
+            status="OK",
+            duration_ms=1,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+
+
+async def test_deleting_a_run_deletes_its_tool_executions(db_session):
+    # ON DELETE CASCADE, proven at runtime. A retention policy that prunes runs
+    # must not leave orphans behind.
+    run = await _run_with_tools(db_session)
+    db_session.add(f.make_tool_execution(run, sequence=0))
+    db_session.add(f.make_tool_execution(run, sequence=1, tool_name="search_available_slots"))
+    await db_session.flush()
+
+    await db_session.execute(sa.delete(AgentRun).where(AgentRun.id == run.id))
+
+    remaining = await db_session.execute(
+        sa.select(sa.func.count())
+        .select_from(ToolExecution)
+        .where(ToolExecution.agent_run_id == run.id)
+    )
+    assert remaining.scalar_one() == 0
+
+
+async def test_two_tool_executions_cannot_share_a_sequence(db_session):
+    # `sequence` is what orders a turn's tool rows: every row of a turn is
+    # written in ONE transaction, and PostgreSQL's now() is constant within a
+    # transaction, so created_at cannot. A duplicate would make the order
+    # ambiguous exactly where it matters.
+    run = await _run_with_tools(db_session)
+    db_session.add(f.make_tool_execution(run, sequence=0))
+    await db_session.flush()
+
+    db_session.add(f.make_tool_execution(run, sequence=0, tool_name="get_clinic_information"))
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
