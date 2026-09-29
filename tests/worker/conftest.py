@@ -20,7 +20,7 @@ from app.channels.whatsapp.client import MetaClient
 from app.config import Settings
 from app.db.models import WebhookInbox
 from app.db.session import SESSION_OPTIONS
-from app.tenants import ConfigTenantResolver
+from app.tenants.resolver import ConfigTenantResolver
 from tests.db import factories as f
 from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
     db_engine,

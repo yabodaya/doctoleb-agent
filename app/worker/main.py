@@ -18,7 +18,7 @@ from app.config import Settings, get_settings
 from app.db.session import dispose_engine, get_sessionmaker
 from app.integrations.openai.chat import OpenAIChatClient
 from app.logging_config import configure_logging
-from app.tenants import ConfigTenantResolver
+from app.tenants.resolver import ConfigTenantResolver
 from app.worker.jobs import process_inbox_event
 
 logger = logging.getLogger(__name__)

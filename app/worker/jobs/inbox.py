@@ -38,7 +38,12 @@ from app.db.repositories import (
 )
 from app.db.repositories.errors import DuplicateRecordError
 from app.integrations.openai import ChatClient, ChatOutcome
-from app.tenants import TenantId, TenantMapError, TenantResolver, UnknownPhoneNumberError
+from app.tenants.ids import TenantId
+from app.tenants.resolver import (
+    TenantMapError,
+    TenantResolver,
+    UnknownPhoneNumberError,
+)
 from app.worker.errors import PermanentJobError, RetryableJobError
 from app.worker.retrying import backoff_seconds
 

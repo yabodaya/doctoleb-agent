@@ -2,7 +2,7 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.tenants import TenantId
+from app.tenants.ids import TenantId
 
 
 class Repository:

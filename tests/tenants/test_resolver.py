@@ -10,7 +10,7 @@ import logging
 import pytest
 
 from app.config import Settings
-from app.tenants import (
+from app.tenants.resolver import (
     ConfigTenantResolver,
     TenantMapError,
     TenantResolver,

@@ -4,7 +4,7 @@ from typing import Any
 
 from app.db.models import DeadLetterJob
 from app.db.repositories.base import Repository
-from app.tenants import TenantId
+from app.tenants.ids import TenantId
 
 
 class DeadLetterJobRepository(Repository):

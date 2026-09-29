@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from app.db.base import Base
 from app.db.enums import Channel
 from app.db.repositories import ContactRepository
-from app.tenants import TenantId
+from app.tenants.ids import TenantId
 
 APP = pathlib.Path(__file__).resolve().parents[2] / "app"
 
@@ -91,3 +91,33 @@ async def test_two_tenants_that_differ_only_in_case_are_different_tenants(db_ses
     assert upper.id != lower.id
     assert upper.tenant_id == "Clinic-Alpha"
     assert lower.tenant_id == "clinic-alpha"
+
+
+def test_naming_the_tenant_type_does_not_import_the_configuration_layer():
+    """Amendment B1, pinned. The trap here is subtle and cost one wrong claim.
+
+    `app/agent/` and `app/db/` both name `TenantId`, and neither may depend on
+    `app.config` (plan section 5.7). Putting the alias in `app/tenants/ids.py`
+    is only half the answer: Python executes a package's `__init__` BEFORE any
+    submodule of it, so while `app/tenants/__init__.py` re-exported the
+    resolver, `from app.tenants.ids import TenantId` still imported
+    `app.config` - invisibly, because the AST import test only sees direct
+    imports.
+
+    A subprocess, because `sys.modules` is global and every other test in this
+    session has already imported half the app.
+    """
+    import subprocess
+    import sys
+
+    program = (
+        "import sys\n"
+        "import app.agent, app.db.repositories, app.integrations.booking\n"
+        "leaked = [n for n in ('app.config', 'app.tenants.resolver') if n in sys.modules]\n"
+        "print(','.join(leaked))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.strip() == "", f"leaked into the import graph: {result.stdout.strip()}"

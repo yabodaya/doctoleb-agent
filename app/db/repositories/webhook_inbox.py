@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db.enums import Channel, InboxStatus
 from app.db.models import WebhookInbox
 from app.db.repositories.base import Repository
-from app.tenants import TenantId
+from app.tenants.ids import TenantId
 
 
 @dataclass(frozen=True)

@@ -28,7 +28,7 @@ from app.db.models import (
     ToolExecution,
     WebhookInbox,
 )
-from app.tenants import TenantId
+from app.tenants.ids import TenantId
 
 # Deliberately NOT UUIDs (decision D1): a tenant id is an opaque string, and
 # test data that looks like a UUID would let a quiet uuid.UUID(...) parse
