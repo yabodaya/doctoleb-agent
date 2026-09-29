@@ -91,6 +91,26 @@ def test_startup_warnings_name_settings_never_values():
     assert all("SENTINEL" not in w for w in warnings)
 
 
-def test_a_fully_configured_worker_warns_about_nothing():
-    """So the warnings mean something when they do appear."""
-    assert startup_warnings(_settings()) == []
+def test_startup_always_warns_that_the_booking_client_is_fake():
+    """Q8, and risk R8: fake availability reaching a real patient.
+
+    Unconditional, because in VS-006 there is no other booking client to
+    configure. VS-011 adds the BOOKING_CLIENT switch and the refusal to start in
+    production; until then this line is the whole of the mitigation.
+    """
+    warnings = startup_warnings(_settings())
+
+    fake = [w for w in warnings if "FAKE" in w]
+    assert len(fake) == 1
+    assert "demo data" in fake[0]
+    assert "never put this worker in front of real patients" in fake[0]
+
+
+def test_a_fully_configured_worker_warns_only_about_the_fake_booking_client():
+    """So the OTHER warnings still mean something when they appear.
+
+    VS-005's version asserted an empty list; the fake-booking line is now
+    unconditional, so the assertion is "nothing else", which is the same
+    guarantee.
+    """
+    assert [w for w in startup_warnings(_settings()) if "FAKE" not in w] == []

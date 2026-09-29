@@ -66,6 +66,15 @@ def startup_warnings(settings: Settings) -> list[str]:
             f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g}: "
             "a slow reply can be cut off mid-send"
         )
+    # Q8, and risk R8: the real danger in this slice is fake availability
+    # reaching a real patient. VS-011 adds the BOOKING_CLIENT switch and the
+    # refusal to start in production; until then this line, on every worker
+    # start, is the whole of the mitigation - with clearly fake names and a
+    # fictional address behind it.
+    warnings.append(
+        "booking service is the in-memory FAKE (VS-006): availability answers are demo "
+        "data - never put this worker in front of real patients"
+    )
     return warnings
 
 

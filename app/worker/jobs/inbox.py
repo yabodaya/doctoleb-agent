@@ -6,6 +6,7 @@ the correctness.
 """
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +16,16 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agent import AgentRuntime, Clock, HistoryEntry, Turn, process_turn, utc_now
+from app.agent import (
+    AgentResult,
+    AgentRuntime,
+    Clock,
+    HistoryEntry,
+    ToolExecutionStatus,
+    Turn,
+    process_turn,
+    utc_now,
+)
 from app.channels.whatsapp.client import MetaClient, SendOutcome
 from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind, StatusUpdate
 from app.channels.whatsapp.redact import scrub
@@ -30,13 +40,16 @@ from app.db.enums import (
 )
 from app.db.models import Message
 from app.db.repositories import (
+    AgentRunRepository,
+    AgentRunRow,
     ContactRepository,
     ConversationRepository,
     DeadLetterJobRepository,
     MessageRepository,
+    ToolExecutionRow,
     WebhookInboxRepository,
 )
-from app.db.repositories.errors import DuplicateRecordError
+from app.db.repositories.errors import DuplicateRecordError, RunNotRecordedError
 from app.integrations.booking import BookingClient
 from app.integrations.openai import ChatClient, ChatOutcome
 from app.tenants.ids import TenantId
@@ -428,12 +441,98 @@ async def _record_generation_failure(
     )
 
 
+@dataclass(frozen=True)
+class GeneratedRun:
+    """One generation, ready to be recorded. Set only when generation ran on
+    THIS try - a retry that finds a reserved reply calls no model and records
+    nothing."""
+
+    result: AgentResult
+    duration_ms: int
+    job_try: int
+
+
+def _tool_rows(result: AgentResult) -> tuple[ToolExecutionRow, ...]:
+    """`ToolCallRecord` -> `ToolExecutionRow`.
+
+    Two small dataclasses and a mapping here, rather than one shared type, is
+    what lets `app/db/` stay ignorant of `app/agent/` and vice versa. The job is
+    the only place that knows both.
+    """
+    return tuple(
+        ToolExecutionRow(
+            sequence=record.sequence,
+            model_call=record.model_call,
+            tool_name=record.tool_name,
+            argument_names=record.argument_names,
+            status=record.status.value,
+            error_code=record.error_code,
+            duration_ms=record.duration_ms,
+        )
+        for record in result.tool_calls
+    )
+
+
+async def _record_run(
+    session: AsyncSession,
+    context: EventContext,
+    run: GeneratedRun | None,
+    *,
+    inbound_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    reply_message_id: uuid.UUID | None,
+) -> None:
+    """Write `agent_runs` and its `tool_executions`, in T1b, in a SAVEPOINT.
+
+    Called AFTER the reservation, deliberately. The repository wraps the inserts
+    in `begin_nested()`, so a bookkeeping failure rolls back only these rows and
+    the patient's reply still goes out - which is the whole reason the savepoint
+    is there (plan risk R4).
+
+    It never calls `session.rollback()`: that would undo the reservation and the
+    generation dead letter too.
+
+    `run is None` means generation did not happen on this try (a retry that
+    found a reserved reply), and there is nothing to record.
+    """
+    if run is None:
+        return
+    try:
+        await AgentRunRepository(session, context.tenant_id).add(
+            AgentRunRow(
+                inbox_event_id=context.event_id,
+                conversation_id=conversation_id,
+                inbound_message_id=inbound_id,
+                reply_message_id=reply_message_id,
+                job_try=run.job_try,
+                # The CONFIGURED model (Q10), NULL when unset. Blank means the
+                # turn never reached OpenAI at all.
+                model=context.settings.openai_chat_model.strip() or None,
+                prompt_version=run.result.prompt_version,
+                outcome=run.result.outcome.value,
+                reason=run.result.reason,
+                model_calls=run.result.model_calls,
+                prompt_tokens=run.result.prompt_tokens,
+                completion_tokens=run.result.completion_tokens,
+                duration_ms=run.duration_ms,
+                tool_executions=_tool_rows(run.result),
+            )
+        )
+    except RunNotRecordedError as error:
+        # The class name only (hard rule 8). Bookkeeping that fails must never
+        # cost a patient their reply, so this is logged and swallowed.
+        logger.error(
+            "agent run not recorded event_id=%s error=%s", context.event_id, error.error_class
+        )
+
+
 async def _drop(
     session: AsyncSession,
     context: EventContext,
     inbound_id: uuid.UUID,
     conversation_id: uuid.UUID,
     failure: str | None = None,
+    run: "GeneratedRun | None" = None,
 ) -> str:
     """Hard rule 7's exit, shared by both reads.
 
@@ -455,6 +554,17 @@ async def _drop(
         await messages.mark_failed(reserved.id)
     if failure is not None:
         await _record_generation_failure(session, context, failure)
+    # Recorded with a NULL reply_message_id: the turn ran and was BILLED, and
+    # nothing was sent because a human had taken over. That is a fact worth
+    # keeping, not an absence.
+    await _record_run(
+        session,
+        context,
+        run,
+        inbound_id=inbound_id,
+        conversation_id=conversation_id,
+        reply_message_id=None,
+    )
     await WebhookInboxRepository(session).mark(context.event_id, InboxStatus.PROCESSED)
     await session.commit()
     # Ids only, never the message (hard rule 7's own wording).
@@ -592,7 +702,9 @@ async def handle_message(context: EventContext) -> str:
     # --- generation: only when no reply row exists yet -----------------------
     reply_text: str | None = None  # None: send the text an earlier try reserved
     failure: str | None = None  # set: the fallback is the reply, and a dead letter is owed
+    run: GeneratedRun | None = None  # set only when generation ran on THIS try
     if turn is not None:
+        started = time.monotonic()
         generated = await process_turn(
             turn,
             context.chat,
@@ -602,16 +714,32 @@ async def handle_message(context: EventContext) -> str:
                 turn_timeout_seconds=context.settings.agent_turn_timeout_seconds,
             ),
         )
+        run = GeneratedRun(
+            result=generated,
+            # Measured around process_turn, so it INCLUDES the tool calls: what
+            # the patient actually waited for.
+            duration_ms=int((time.monotonic() - started) * 1000),
+            job_try=context.job_try,
+        )
+        # Codes and counts only. No tool NAMES (the same reasoning as Q9: an
+        # unknown one is model-written), no arguments, no results, no text.
         logger.info(
             "reply generated event_id=%s outcome=%s reason=%s prompt_version=%s "
-            "history=%d prompt_tokens=%s completion_tokens=%s",
+            "history=%d model_calls=%d tool_calls=%d tool_errors=%d "
+            "prompt_tokens=%s completion_tokens=%s duration_ms=%d",
             context.event_id,
             generated.outcome.value,
             generated.reason,
             generated.prompt_version,
             len(turn.history),
+            generated.model_calls,
+            len(generated.tool_calls),
+            sum(
+                1 for record in generated.tool_calls if record.status is not ToolExecutionStatus.OK
+            ),
             generated.prompt_tokens,
             generated.completion_tokens,
+            run.duration_ms,
         )
         if generated.outcome is ChatOutcome.SUCCESS:
             reply_text = generated.reply_text
@@ -638,7 +766,7 @@ async def handle_message(context: EventContext) -> str:
         # send has to come after it.
         state = await conversations.current_state(conversation_id)
         if state is None or state not in _AI_STATES:
-            return await _drop(session, context, inbound_id, conversation_id, failure)
+            return await _drop(session, context, inbound_id, conversation_id, failure, run=run)
 
         if reply_text is not None:
             # WITH the text. Once a text is reserved, that text IS the reply:
@@ -660,6 +788,16 @@ async def handle_message(context: EventContext) -> str:
         if failure is not None:
             # In THIS transaction, with the reservation (plan conflict C7).
             await _record_generation_failure(session, context, failure)
+        # AFTER the reservation, inside its own SAVEPOINT: if this fails, only
+        # these rows roll back and the reply still goes out.
+        await _record_run(
+            session,
+            context,
+            run,
+            inbound_id=inbound_id,
+            conversation_id=conversation_id,
+            reply_message_id=reply_id,
+        )
         # COMMIT before touching Meta. A reply row written in the same
         # transaction as the wamid would leave no trace of an attempted send, and
         # the retry would have nothing to recognise.
