@@ -8,7 +8,7 @@ Work in order. Set exactly one slice to IN PROGRESS at a time.
 | VS-003 | Receive WhatsApp webhook | PARTIAL |
 | VS-004 | Worker + send reply | PARTIAL |
 | VS-005 | AI replies | PARTIAL |
-| VS-006 | Agent Core + first tool | TODO |
+| VS-006 | Agent Core + first tool | IN PROGRESS |
 | VS-007 | Booking tools | TODO |
 | VS-008 | Voice notes in | TODO |
 | VS-009 | Voice note replies | TODO |
@@ -24,6 +24,6 @@ Meta is outstanding.
 Both are waiting on the same sitting: the first real WhatsApp message proves both,
 so they are tested together. See `docs/plans/VS-004-plan.md`, Task 10 — which
 leads with the two most likely reasons Meta is not delivering yet.
-VS-005 is **code complete** on `feat/vs-005-ai-replies`; its own live test
+VS-005 is **merged** to `main`; its own live test
 (Task 9 of `docs/plans/VS-005-plan.md`) needs that sitting to have worked first,
 because until Meta delivers a real message no AI reply can be observed either.
