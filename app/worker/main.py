@@ -52,11 +52,15 @@ def startup_warnings(settings: Settings) -> list[str]:
         warnings.append("OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY")
     if not settings.openai_chat_model.strip():
         warnings.append("OPENAI_CHAT_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY")
-    budget = settings.openai_timeout_seconds + settings.meta_send_timeout_seconds
+    # Decision D4: the job must cover the WHOLE tool loop plus the one send.
+    # OPENAI_TIMEOUT_SECONDS is deliberately not in this sum - it bounds one
+    # model call, and every model call happens inside the turn budget. Naming it
+    # here would point an operator at the wrong knob.
+    budget = settings.agent_turn_timeout_seconds + settings.meta_send_timeout_seconds
     if settings.job_timeout_seconds <= budget:
         warnings.append(
             f"JOB_TIMEOUT_SECONDS={settings.job_timeout_seconds:g} does not exceed "
-            f"OPENAI_TIMEOUT_SECONDS={settings.openai_timeout_seconds:g} + "
+            f"AGENT_TURN_TIMEOUT_SECONDS={settings.agent_turn_timeout_seconds:g} + "
             f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g}: "
             "a slow reply can be cut off mid-send"
         )

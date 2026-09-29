@@ -55,21 +55,32 @@ def test_startup_warns_when_the_openai_model_is_unset():
     assert any("OPENAI_CHAT_MODEL is not set" in w for w in warnings)
 
 
-def test_startup_warns_when_the_job_timeout_cannot_cover_both_calls():
-    """Plan assumption A14. A loud runtime signal, not a dead process: the api
-    must not refuse to boot over a worker knob.
+def test_startup_warns_when_the_job_timeout_cannot_cover_the_turn_and_the_send():
+    """Plan assumption A14, with VS-006's arithmetic (plan section 5.2).
 
-    A job arq times out is finished as failed and never retried, and none of our
-    exit paths run - so the event is stranded with no dead letter.
+    The relation changed: the job must now cover the WHOLE tool loop plus the
+    send, not one model call plus the send. Every model call runs inside
+    AGENT_TURN_TIMEOUT_SECONDS, so OPENAI_TIMEOUT_SECONDS is no longer part of
+    the sum - four of them at 30s each would be 120s on their own.
+
+    A warning and not a boot failure: the api must not refuse to start over a
+    worker knob. A job arq times out is finished as failed and never retried,
+    and none of our exit paths run - so the event is stranded with no dead
+    letter.
     """
     warnings = startup_warnings(
-        _settings(job_timeout_seconds=20, openai_timeout_seconds=30, meta_send_timeout_seconds=10)
+        _settings(
+            job_timeout_seconds=50, agent_turn_timeout_seconds=45, meta_send_timeout_seconds=10
+        )
     )
 
     timeout_warning = [w for w in warnings if "JOB_TIMEOUT_SECONDS" in w]
     assert len(timeout_warning) == 1
-    for fragment in ("20", "OPENAI_TIMEOUT_SECONDS=30", "META_SEND_TIMEOUT_SECONDS=10"):
+    for fragment in ("50", "AGENT_TURN_TIMEOUT_SECONDS=45", "META_SEND_TIMEOUT_SECONDS=10"):
         assert fragment in timeout_warning[0], fragment
+    # The per-call deadline is deliberately NOT named: it is not in the sum any
+    # more, and naming it would send an operator to the wrong knob.
+    assert "OPENAI_TIMEOUT_SECONDS" not in timeout_warning[0]
 
 
 def test_startup_warnings_name_settings_never_values():

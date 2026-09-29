@@ -105,12 +105,16 @@ class Settings(BaseSettings):
     job_max_tries: int = 5
     job_backoff_base_seconds: float = 5.0
     job_backoff_max_seconds: float = 300.0
-    # Must stay above openai_timeout_seconds + meta_send_timeout_seconds. A job
-    # arq times out is finished as failed and never retried, and none of our exit
-    # paths run: no dead letter, no lease release, and nothing re-enqueues the
-    # event. tests/test_config.py pins the relation on the defaults, and the
-    # worker warns at startup when a deployment breaks it.
-    job_timeout_seconds: float = 60.0
+    # Must stay above agent_turn_timeout_seconds + meta_send_timeout_seconds
+    # (decision D4; 45 + 10 = 55, so 90 leaves 35s for the job's four
+    # transactions). NOT openai_timeout_seconds: every model call now runs
+    # inside the turn budget, so the loop is what this has to cover.
+    #
+    # A job arq times out is finished as failed and never retried, and none of
+    # our exit paths run: no dead letter, no lease release, and nothing
+    # re-enqueues the event. tests/test_config.py pins the relation on the
+    # defaults, and the worker warns at startup when a deployment breaks it.
+    job_timeout_seconds: float = 90.0
     # Added to job_timeout_seconds to get the claim lease (plan note C3a). The
     # lease MUST outlive the job: if it expires while the job is still inside
     # the Meta call, a second worker claims the same event and sends the same
@@ -128,9 +132,10 @@ class Settings(BaseSettings):
     # (plan conflict C1, resolved by execution amendment A1). The reason code
     # names the concept rather than the key, so VS-008 and VS-009 reuse it.
     openai_chat_model: str = ""
-    # Hard rule 11: one model call, enforced as a WALL-CLOCK deadline - the SDK's
-    # own timeout applies per connection phase. job_timeout_seconds must exceed
-    # this plus meta_send_timeout_seconds; tests/test_config.py pins it.
+    # Hard rule 11: ONE model call, enforced as a WALL-CLOCK deadline - the
+    # SDK's own timeout applies per connection phase. A turn makes up to
+    # MAX_MODEL_CALLS of them, all inside agent_turn_timeout_seconds, so this
+    # value is no longer part of the job-timeout relation (decision D4).
     openai_timeout_seconds: float = Field(default=30.0, gt=0)
     # Sent as max_completion_tokens. For reasoning models it also covers their
     # hidden reasoning tokens - hence the headroom over a short WhatsApp reply
@@ -142,6 +147,19 @@ class Settings(BaseSettings):
     agent_history_messages: int = Field(default=20, ge=0)
     # Sent instead of an AI reply when one cannot be produced (requirement 4).
     agent_fallback_reply: str = "Sorry, we can't reply right now. The clinic will get back to you."
+    # Decision D4: ONE deadline around the WHOLE tool loop - up to
+    # MAX_MODEL_CALLS model calls and every tool call between them. Plan
+    # section 5.2's arithmetic:
+    #
+    #   network worst case = agent_turn_timeout_seconds (45)
+    #                      + meta_send_timeout_seconds  (10)  = 55
+    #   job_timeout_seconds (90) > 55, leaving 35s for T0, T1, T1b and T2
+    #   claim lease = 90 + job_lease_margin_seconds (30) = 120 > 90
+    #
+    # It bounds two different things at once: how long a patient waits before
+    # the fallback, and whether the job finishes inside arq's timeout - which is
+    # the one deadline with no exit path of ours behind it.
+    agent_turn_timeout_seconds: float = Field(default=45.0, gt=0)
 
     @field_validator("meta_api_version", "meta_api_base_url", "agent_fallback_reply", mode="before")
     @classmethod
