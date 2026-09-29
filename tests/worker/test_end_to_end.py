@@ -473,13 +473,13 @@ async def test_the_second_message_carries_the_first_exchange_to_the_model(pipeli
     await pipeline.drain(meta, chat=real_chat(openai, settings), settings=settings)
 
     second = openai.bodies()[1]["messages"]
-    assert [m["role"] for m in second] == ["system", "user", "assistant", "user"]
+    # VS-006 inserted the clock message (a `system` turn) between the history
+    # and the message being answered - decision D3, plan conflict C12.
+    assert [m["role"] for m in second] == ["system", "user", "assistant", "system", "user"]
     assert second[0]["content"].startswith("You are the WhatsApp receptionist")
-    assert [m["content"] for m in second[1:]] == [
-        PATIENT_TEXT,
-        "first answer",
-        "and about the cost?",
-    ]
+    assert [m["content"] for m in second[1:3]] == [PATIENT_TEXT, "first answer"]
+    assert second[3]["content"].startswith("Current date and time at the clinic")
+    assert second[4]["content"] == "and about the cost?"
 
 
 async def test_the_model_request_contains_no_ids_names_or_phone_numbers(sessionmaker_for, pipeline):

@@ -13,9 +13,11 @@ import httpx
 from arq.connections import RedisSettings
 from arq.worker import func
 
+from app.agent import utc_now
 from app.channels.whatsapp.client import MetaClient
 from app.config import Settings, get_settings
 from app.db.session import dispose_engine, get_sessionmaker
+from app.integrations.booking.fake import FakeBookingClient
 from app.integrations.openai.chat import OpenAIChatClient
 from app.logging_config import configure_logging
 from app.tenants.resolver import ConfigTenantResolver
@@ -92,6 +94,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     # without a key: it reports openai_api_key_unset instead of failing to
     # construct, so the worker boots with no OpenAI account at all.
     ctx["chat"] = OpenAIChatClient(settings)
+    # VS-006. The clock is injected so nothing below reads the wall clock
+    # directly, and the booking client is the in-memory FAKE - see the warning
+    # in startup_warnings().
+    ctx["clock"] = utc_now
+    ctx["booking"] = FakeBookingClient.demo(clock=utc_now)
     ctx["resolver"] = ConfigTenantResolver.from_settings(settings)
     logger.info("worker started")
 

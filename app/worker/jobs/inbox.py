@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agent import HistoryEntry, Turn, process_turn
+from app.agent import AgentRuntime, Clock, HistoryEntry, Turn, process_turn, utc_now
 from app.channels.whatsapp.client import MetaClient, SendOutcome
 from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind, StatusUpdate
 from app.channels.whatsapp.redact import scrub
@@ -37,6 +37,7 @@ from app.db.repositories import (
     WebhookInboxRepository,
 )
 from app.db.repositories.errors import DuplicateRecordError
+from app.integrations.booking import BookingClient
 from app.integrations.openai import ChatClient, ChatOutcome
 from app.tenants.ids import TenantId
 from app.tenants.resolver import (
@@ -79,6 +80,12 @@ class EventContext:
     # handler decides "fall back instead of retrying" with exactly the
     # comparison the envelope uses to decide "dead-letter instead of deferring".
     chat: ChatClient
+    # VS-006. `booking` is the Booking Service behind its interface, and
+    # `clock` is the one wall-clock read a turn makes (decision D3). Both are
+    # injected rather than reached for, so a test can freeze the clock and hand
+    # the tools a spy.
+    booking: BookingClient
+    clock: Clock
     job_try: int = 1
 
     @property
@@ -110,6 +117,8 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
     resolver: TenantResolver = ctx["resolver"]
     meta: MetaClient = ctx["meta"]
     chat: ChatClient = ctx["chat"]
+    booking: BookingClient = ctx["booking"]
+    clock: Clock = ctx.get("clock", utc_now)
     event_id = uuid.UUID(row_id)
 
     kind: str | None = None
@@ -172,6 +181,8 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
             sessionmaker=sessionmaker,
             meta=meta,
             chat=chat,
+            booking=booking,
+            clock=clock,
             job_try=job_try,
         )
         outcome = await handler(context)
@@ -582,7 +593,15 @@ async def handle_message(context: EventContext) -> str:
     reply_text: str | None = None  # None: send the text an earlier try reserved
     failure: str | None = None  # set: the fallback is the reply, and a dead letter is owed
     if turn is not None:
-        generated = await process_turn(turn, context.chat)
+        generated = await process_turn(
+            turn,
+            context.chat,
+            AgentRuntime(
+                booking=context.booking,
+                clock=context.clock,
+                turn_timeout_seconds=context.settings.agent_turn_timeout_seconds,
+            ),
+        )
         logger.info(
             "reply generated event_id=%s outcome=%s reason=%s prompt_version=%s "
             "history=%d prompt_tokens=%s completion_tokens=%s",

@@ -9,6 +9,7 @@ genuinely independent connections, which the rollback-wrapped db_session cannot
 provide.
 """
 
+import datetime as dt
 import uuid
 from typing import Any
 
@@ -20,6 +21,7 @@ from app.channels.whatsapp.client import MetaClient
 from app.config import Settings
 from app.db.models import WebhookInbox
 from app.db.session import SESSION_OPTIONS
+from app.integrations.booking.fake import FakeBookingClient
 from app.tenants.resolver import ConfigTenantResolver
 from tests.db import factories as f
 from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
@@ -180,6 +182,16 @@ async def store_event(sessionmaker, payload: dict[str, Any], n: int = 1, **overr
         return row.id
 
 
+# Tuesday 29 September 2026, 10:00 clinic local. The same instant Task 9's
+# acceptance test freezes, so "tomorrow" is Wednesday the 30th and Dr. Karim's
+# afternoon is 14:00, 14:20, 15:40, 16:20.
+FROZEN = dt.datetime(2026, 9, 29, 7, tzinfo=dt.UTC)
+
+
+def FROZEN_CLOCK() -> dt.datetime:  # noqa: N802 - it is a clock, not a class
+    return FROZEN
+
+
 def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None, **overrides):
     """The arq ctx dict a job is called with."""
     settings = settings or worker_settings()
@@ -191,6 +203,11 @@ def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None
         # test can reach OpenAI. A test that cares passes chat=FakeChatClient(...)
         # or the real OpenAIChatClient over an httpx2.MockTransport.
         "chat": FakeChatClient(),
+        # VS-006: a FROZEN clock and the demo booking data by default, so every
+        # VS-004 and VS-005 test runs unchanged (FakeChatClient(ok()) asks for
+        # no tools) while a test that cares can pass a RecordingBooking.
+        "clock": FROZEN_CLOCK,
+        "booking": FakeBookingClient.demo(clock=FROZEN_CLOCK),
         "resolver": ConfigTenantResolver.from_settings(settings),
         "job_try": 1,
     }

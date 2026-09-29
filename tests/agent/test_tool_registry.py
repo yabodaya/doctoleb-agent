@@ -528,3 +528,36 @@ def test_the_agent_status_enum_matches_the_database_one():
 
     assert [s.value for s in ToolExecutionStatus] == [s.value for s in DbStatus]
     assert {s.name for s in ToolExecutionStatus} == {s.name for s in DbStatus}
+
+
+def test_the_tool_specs_and_clock_template_are_pinned_to_the_prompt_version():
+    """Q13. The tool descriptions and the clock message instruct the model as
+    much as the system prompt does.
+
+    A tool description is read on EVERY model call and is what the model uses to
+    decide which tool to call and how - amendment B2's three time periods live
+    there, not in the prompt. Pinning only the prompt would let someone change
+    "afternoon is 12:00 to 17:00" without a version bump, and the `agent_runs`
+    row would still say `vs006-1`.
+
+    If this fails after an intentional edit: bump SYSTEM_PROMPT_VERSION, add
+    both digests (this one and the prompt's), and keep the old entries.
+    """
+    import hashlib
+    from dataclasses import asdict
+
+    from app.agent.clock import CLOCK_TEMPLATE
+    from app.agent.prompts import SYSTEM_PROMPT_VERSION
+
+    pinned = {
+        "vs006-1": "966c838e54d036ed07a8a43973429bb7fd02e35537139e08a6578d71845c34a1",
+    }
+    specs = json.dumps([asdict(spec) for spec in default_registry().specs()], sort_keys=True)
+    digest = hashlib.sha256((specs + CLOCK_TEMPLATE).encode("utf-8")).hexdigest()
+
+    assert SYSTEM_PROMPT_VERSION in pinned, (
+        f"unpinned version {SYSTEM_PROMPT_VERSION}: add its tool digest {digest}"
+    )
+    assert digest == pinned[SYSTEM_PROMPT_VERSION], (
+        f"a tool spec or the clock template changed without a version bump; new digest is {digest}"
+    )
