@@ -23,7 +23,7 @@ def turn(
     history: tuple[HistoryEntry, ...] = (),
 ) -> Turn:
     return Turn(
-        tenant_id=uuid.uuid4(),
+        tenant_id="clinic-alpha",  # opaque, never a UUID (decision D1)
         contact_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         modality=modality,

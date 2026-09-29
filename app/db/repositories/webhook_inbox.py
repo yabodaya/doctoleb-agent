@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db.enums import Channel, InboxStatus
 from app.db.models import WebhookInbox
 from app.db.repositories.base import Repository
+from app.tenants import TenantId
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,7 @@ class WebhookInboxRepository(Repository):
             .values(status=status.value, last_error=error, locked_until=None)
         )
 
-    async def attach_tenant(self, row_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+    async def attach_tenant(self, row_id: uuid.UUID, tenant_id: TenantId) -> None:
         """Record the tenant once the worker has resolved it from phone_number_id."""
         await self._session.execute(
             sa.update(WebhookInbox).where(WebhookInbox.id == row_id).values(tenant_id=tenant_id)

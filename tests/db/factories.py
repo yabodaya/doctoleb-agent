@@ -6,7 +6,6 @@ traced to a person.
 """
 
 import datetime as dt
-import uuid
 from typing import Any
 
 from app.db.enums import (
@@ -18,9 +17,13 @@ from app.db.enums import (
     MessageStatus,
 )
 from app.db.models import Contact, ContactIdentity, Conversation, Message, WebhookInbox
+from app.tenants import TenantId
 
-TENANT_A = uuid.UUID("00000000-0000-4000-8000-00000000000a")
-TENANT_B = uuid.UUID("00000000-0000-4000-8000-00000000000b")
+# Deliberately NOT UUIDs (decision D1): a tenant id is an opaque string, and
+# test data that looks like a UUID would let a quiet uuid.UUID(...) parse
+# survive anywhere in the stack.
+TENANT_A: TenantId = "clinic-alpha"
+TENANT_B: TenantId = "clinic-beta"
 
 # PostgreSQL's now() is the TRANSACTION start time, constant for a whole test.
 # Any assertion that a timestamp column moved needs the column set to a fixed
@@ -52,14 +55,14 @@ def make_inbox(n: int, **overrides: Any) -> WebhookInbox:
     return WebhookInbox(**values)
 
 
-def make_contact(tenant_id: uuid.UUID = TENANT_A, **overrides: Any) -> Contact:
+def make_contact(tenant_id: TenantId = TENANT_A, **overrides: Any) -> Contact:
     values: dict[str, Any] = {"tenant_id": tenant_id, "display_name": "Test Patient"}
     values.update(overrides)
     return Contact(**values)
 
 
 def make_identity(
-    contact: Contact, n: int = 1, tenant_id: uuid.UUID | None = None, **overrides: Any
+    contact: Contact, n: int = 1, tenant_id: TenantId | None = None, **overrides: Any
 ) -> ContactIdentity:
     values: dict[str, Any] = {
         "tenant_id": tenant_id or contact.tenant_id,

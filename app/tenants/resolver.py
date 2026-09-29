@@ -7,19 +7,21 @@ the first slice that depends on the answer.
 
 import json
 import logging
-import uuid
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from app.config import Settings
+from app.tenants.ids import TenantId
 
 logger = logging.getLogger(__name__)
 
-# The one place this repo names the tenant id type. VS-002 left it unconfirmed
-# (plan conflict note C11) and every table has it as sa.Uuid; if it ever becomes
-# something else, this alias plus one migration are the change, rather than every
-# signature in app/worker/.
-TenantId = uuid.UUID
+__all__ = [
+    "ConfigTenantResolver",
+    "TenantId",
+    "TenantMapError",
+    "TenantResolver",
+    "UnknownPhoneNumberError",
+]
 
 
 class UnknownPhoneNumberError(Exception):
@@ -51,6 +53,36 @@ class TenantMapError(Exception):
     def __init__(self, reason: str = "bad_tenant_map") -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+def _valid_tenant_id(value: object) -> TenantId:
+    """Hygiene for an opaque tenant id, and nothing more (decision D1, Q2).
+
+    Opaque means this function must not decide what a tenant id LOOKS like: no
+    UUID parse, no length cap, no case folding, no stripping. It returns the
+    value unchanged or refuses it.
+
+    What it does refuse, and why:
+
+    - anything that is not a `str`, and the empty string: neither is an
+      identifier, and both would scope every query to nothing;
+    - leading or trailing whitespace: " clinic" and "clinic" would be two
+      tenants that look identical in a config file and in a psql column;
+    - anything `str.isprintable()` rejects. That is the load-bearing one. It
+      catches CR and LF, which would be a header-injection hazard the moment
+      VS-011 puts this value in `X-Tenant-Id` (plan conflict C4e), and it
+      catches zero-width characters, which produce a tenant nobody can see is
+      different from the one they meant.
+
+    The offending value is never named in the exception (hard rule 8/9): the
+    map's values scope every query in the system, and an exception message is
+    the least controlled string we have.
+    """
+    if not isinstance(value, str) or not value:
+        raise TenantMapError() from None
+    if value != value.strip() or not value.isprintable():
+        raise TenantMapError() from None
+    return value
 
 
 @runtime_checkable
@@ -125,15 +157,9 @@ class ConfigTenantResolver:
 
     @staticmethod
     def _parse_pair(phone_number_id: object, tenant_id: object) -> dict[str, TenantId]:
-        if not isinstance(phone_number_id, str) or not isinstance(tenant_id, str):
+        if not isinstance(phone_number_id, str):
             raise TenantMapError() from None
-        try:
-            return {phone_number_id: TenantId(tenant_id)}
-        except (ValueError, AttributeError, TypeError):
-            # ValueError covers a malformed uuid; the others cover a JSON value
-            # that got through the isinstance check in some future edit. The
-            # offending value is deliberately not in the exception.
-            raise TenantMapError() from None
+        return {phone_number_id: _valid_tenant_id(tenant_id)}
 
     def resolve(self, phone_number_id: str) -> TenantId:
         """The tenant for this number, or a permanent error.

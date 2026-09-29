@@ -35,7 +35,7 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
     )
 
-    tenant_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     contact_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, sa.ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False
     )

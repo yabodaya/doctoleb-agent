@@ -4,7 +4,6 @@ Hard rule 1: the webhook endpoint only verifies, dedupes, stores here, enqueues
 and returns 200. Everything downstream reads from this row, not from the request.
 """
 
-import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -28,7 +27,7 @@ class WebhookInbox(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Nullable: the tenant is resolved from phone_number_id by the worker
     # (hard rule 4). Requiring it here would force resolution inside the
     # webhook request, which hard rule 1 forbids.
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    tenant_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(
         sa.String(16), nullable=False, default=InboxStatus.RECEIVED.value

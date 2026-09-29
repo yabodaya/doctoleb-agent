@@ -14,6 +14,10 @@ from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION
 from app.db.enums import MessageModality
 from app.integrations.openai import ChatClient, ChatMessage, ChatOutcome
 
+# app.tenants.ids, not app.tenants: the package's __init__ imports the resolver,
+# which reads Settings, and app/agent/ must not import app.config.
+from app.tenants.ids import TenantId
+
 
 @dataclass(frozen=True)
 class Turn:
@@ -29,7 +33,7 @@ class Turn:
     to the model (hard rule 4): build_messages does not read them.
     """
 
-    tenant_id: uuid.UUID
+    tenant_id: TenantId
     contact_id: uuid.UUID
     conversation_id: uuid.UUID
     modality: MessageModality

@@ -1,8 +1,8 @@
 """The tenant boundary, made structural."""
 
-import uuid
-
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.tenants import TenantId
 
 
 class Repository:
@@ -28,12 +28,16 @@ class TenantScopedRepository(Repository):
     acceptance test for it run with no database.
     """
 
-    def __init__(self, session: AsyncSession, tenant_id: uuid.UUID) -> None:
-        if not tenant_id:
+    def __init__(self, session: AsyncSession, tenant_id: TenantId) -> None:
+        # isinstance, not a truthiness check: decision D1 made the tenant a
+        # TEXT column, so a uuid.UUID object left behind by stale code would be
+        # truthy here and then stringified by the driver into a tenant nobody
+        # configured. This is the one place that can still catch it.
+        if not isinstance(tenant_id, str) or not tenant_id:
             raise ValueError("tenant_id is required")
         super().__init__(session)
         self._tenant_id = tenant_id
 
     @property
-    def tenant_id(self) -> uuid.UUID:
+    def tenant_id(self) -> TenantId:
         return self._tenant_id

@@ -2,6 +2,7 @@
 repositories on top of them."""
 
 import datetime as dt
+import uuid
 
 import pytest
 import sqlalchemy as sa
@@ -54,7 +55,7 @@ async def test_an_invalid_conversation_state_is_rejected(db_session):
     with pytest.raises(IntegrityError):
         await db_session.execute(
             sa.insert(Conversation).values(
-                id=f.uuid.uuid4(),
+                id=uuid.uuid4(),
                 tenant_id=contact.tenant_id,
                 contact_id=contact.id,
                 channel="whatsapp",
@@ -237,7 +238,7 @@ async def test_an_unknown_modality_is_still_rejected(db_session):
     with pytest.raises(IntegrityError):
         await db_session.execute(
             sa.insert(Message).values(
-                id=f.uuid.uuid4(),
+                id=uuid.uuid4(),
                 tenant_id=conversation.tenant_id,
                 conversation_id=conversation.id,
                 direction="INBOUND",

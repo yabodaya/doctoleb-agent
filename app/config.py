@@ -80,7 +80,10 @@ class Settings(BaseSettings):
     # so this is the whole budget for one attempt.
     meta_send_timeout_seconds: float = 10.0
 
-    # phone_number_id -> tenant uuid, as JSON: {"100000000000001": "…uuid…"}.
+    # phone_number_id -> opaque tenant id, as JSON:
+    #   {"100000000000001": "demo-clinic"}
+    # The value is stored and sent exactly as written (decision D1): it is
+    # never parsed, never normalised and matched case-sensitively.
     # Deliberately a str and not a dict[str, str] (plan assumption A1):
     # pydantic-settings JSON-decodes complex fields, and .env.example ships keys
     # with empty values, so `WHATSAPP_TENANT_MAP=` would raise at import and stop

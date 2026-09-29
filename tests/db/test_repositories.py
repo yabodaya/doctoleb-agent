@@ -328,9 +328,9 @@ async def test_a_dead_letter_job_may_have_no_tenant(db_session):
         payload={"n": 2},
         error="BookingTimeout",
         attempts=5,
-        tenant_id=uuid.uuid4(),
+        tenant_id=f.TENANT_B,
     )
-    assert with_tenant.tenant_id is not None
+    assert with_tenant.tenant_id == f.TENANT_B
 
 
 async def test_get_or_create_by_identity_yields_to_the_winner_of_a_race(db_session, monkeypatch):

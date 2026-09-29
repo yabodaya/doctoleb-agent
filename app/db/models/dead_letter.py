@@ -4,7 +4,6 @@ Hard rule 11: jobs that keep failing land here instead of retrying forever.
 A row is a thing a human looks at, not something the worker reads back.
 """
 
-import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -20,7 +19,7 @@ class DeadLetterJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Nullable: a job can die before tenant resolution succeeds, and that is
     # precisely the failure most worth recording.
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    tenant_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     job_name: Mapped[str] = mapped_column(sa.String(100), nullable=False)
     # The webhook_inbox row this job came from: its id, as a string.
     #
