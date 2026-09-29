@@ -7,7 +7,7 @@ Nothing in this module carries a literal credential.
 from functools import lru_cache
 from typing import Any
 
-from pydantic import ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,16 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # A blank value means "not set" (plan conflict C5). .env.example lists
+        # every key with an empty value, and `docker compose` turns `KEY=` into an
+        # empty environment variable. Without this, `META_SEND_TIMEOUT_SECONDS=`
+        # (VS-004) or `OPENAI_TIMEOUT_SECONDS=` fails float validation and neither
+        # the api nor the worker boots from a copy of the example file.
+        #
+        # Credentials are unaffected: their default IS "", so a blank key still
+        # means "every call fails visibly", never "fall back to something". A blank
+        # REQUIRED value (DATABASE_URL) is still a loud failure at boot.
+        env_ignore_empty=True,
     )
 
     app_env: str = "development"
@@ -92,8 +102,11 @@ class Settings(BaseSettings):
     job_max_tries: int = 5
     job_backoff_base_seconds: float = 5.0
     job_backoff_max_seconds: float = 300.0
-    # Must stay above meta_send_timeout_seconds, or arq cancels a job mid-send
-    # and every slow send becomes an ambiguous one.
+    # Must stay above openai_timeout_seconds + meta_send_timeout_seconds. A job
+    # arq times out is finished as failed and never retried, and none of our exit
+    # paths run: no dead letter, no lease release, and nothing re-enqueues the
+    # event. tests/test_config.py pins the relation on the defaults, and the
+    # worker warns at startup when a deployment breaks it.
     job_timeout_seconds: float = 60.0
     # Added to job_timeout_seconds to get the claim lease (plan note C3a). The
     # lease MUST outlive the job: if it expires while the job is still inside
@@ -101,7 +114,33 @@ class Settings(BaseSettings):
     # reply. 30s of slack covers a job that arq is in the middle of cancelling.
     job_lease_margin_seconds: float = 30.0
 
-    @field_validator("meta_api_version", "meta_api_base_url", mode="before")
+    # OpenAI (VS-005). Empty by default for the same reason as the Meta
+    # credentials: the app must boot without them, and "not configured" means
+    # every reply is agent_fallback_reply, with a dead letter naming the reason.
+    openai_api_key: str = ""
+    # No default, on purpose (CLAUDE.md: model names come from env vars, never
+    # from code). Blank = permanent failure `openai_model_unset` + the fallback.
+    # Named OPENAI_CHAT_MODEL, next to OPENAI_TRANSCRIBE_MODEL and
+    # OPENAI_TTS_MODEL, which .env.example has carried since the first commit
+    # (plan conflict C1, resolved by execution amendment A1). The reason code
+    # names the concept rather than the key, so VS-008 and VS-009 reuse it.
+    openai_chat_model: str = ""
+    # Hard rule 11: one model call, enforced as a WALL-CLOCK deadline - the SDK's
+    # own timeout applies per connection phase. job_timeout_seconds must exceed
+    # this plus meta_send_timeout_seconds; tests/test_config.py pins it.
+    openai_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Sent as max_completion_tokens. For reasoning models it also covers their
+    # hidden reasoning tokens - hence the headroom over a short WhatsApp reply
+    # (plan assumption A3). Only generated tokens are billed.
+    openai_max_output_tokens: int = Field(default=1000, gt=0)
+
+    # Agent Core (VS-005). Earlier messages of the conversation sent with each
+    # reply, besides the one being answered (plan assumption A8).
+    agent_history_messages: int = Field(default=20, ge=0)
+    # Sent instead of an AI reply when one cannot be produced (requirement 4).
+    agent_fallback_reply: str = "Sorry, we can't reply right now. The clinic will get back to you."
+
+    @field_validator("meta_api_version", "meta_api_base_url", "agent_fallback_reply", mode="before")
     @classmethod
     def _blank_means_unset(cls, value: Any, info: ValidationInfo) -> Any:
         """Treat an empty string as "not set" for the two settings with real defaults.
@@ -111,6 +150,11 @@ class Settings(BaseSettings):
         a perfectly good `str` and which would then build a send URL with a
         missing path segment. Every reply would fail with a 404 that looks like a
         bug in the client rather than a missing .env entry.
+
+        AGENT_FALLBACK_REPLY is here for the same reason: a blank fallback can
+        only mean "unset", because an empty message is not a reply - and sending
+        "" to Meta is a permanent 4xx, so the one path that exists to answer a
+        patient when everything else has failed would itself fail.
 
         Deliberately NOT applied to the credentials: an empty META_ACCESS_TOKEN
         must stay empty, because "not configured" has to mean "every send fails

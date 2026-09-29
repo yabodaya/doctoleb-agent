@@ -20,6 +20,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+import httpx2
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -54,3 +55,24 @@ def client_for():
         return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def no_real_http2_transport(monkeypatch):
+    """No test may reach OpenAI (VS-005 requirement 1).
+
+    The OpenAI SDK sends through httpx2's real transport - a different package
+    from the httpx the Meta client uses (plan conflict C8) - unless a test hands
+    it an httpx2.MockTransport. Making the real one raise turns "a test forgot
+    the fake" into a loud failure instead of a request billed to whichever key
+    happens to be in the developer's environment.
+
+    Verified against openai 3.20.0: the SDK propagates a transport's own
+    exception unchanged rather than wrapping it in APIConnectionError, so this
+    cannot be mistaken for an outage and retried five times.
+    """
+
+    async def refuse(self, request):
+        raise RuntimeError("a test tried to reach the network through httpx2")
+
+    monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", refuse)

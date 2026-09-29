@@ -15,6 +15,12 @@ dependencies = [
     # from the api image and the worker image. It was dev-only while the test
     # client was the only user.
     "httpx>=0.27",
+    # The OpenAI SDK, for AI replies (VS-005). Imported by exactly one module,
+    # app/integrations/openai/chat.py. The major-version ceiling is deliberate:
+    # a new major is an upgrade to make on purpose, not one a re-lock should
+    # pick up. It brings its own HTTP stack (httpx2, not the httpx above) - see
+    # docs/plans/VS-005-plan.md, C8.
+    "openai>=3.20,<4",
     "redis>=5.2",
     "arq>=0.26",
     "alembic>=1.14",

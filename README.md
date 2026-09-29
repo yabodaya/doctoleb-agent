@@ -155,13 +155,49 @@ and it is why the api stays fast when Meta is slow.
 
 ```powershell
 docker compose up            # api, worker, postgres, redis
-docker compose logs -f worker | Select-String "inbox event"
+docker compose logs -f worker | Select-String "inbox event|reply generated"
 ```
 
 One line per job. `event_id` is the `webhook_inbox` row id, and every outcome is
-one of: `replied`, `sent_without_id`, `stored_no_reply`, `dropped_not_ai_active`,
-`already_replied`, `status_advanced`, `status_not_moved`, `status_ignored`,
-`skipped`, `dead_lettered`.
+one of: `replied`, `replied_fallback`, `sent_without_id`, `stored_no_reply`,
+`dropped_not_ai_active`, `already_replied`, `status_advanced`,
+`status_not_moved`, `status_ignored`, `skipped`, `dead_lettered`.
+
+### AI replies
+
+Every text message is answered by an OpenAI model, once, from the clinic's
+system prompt and the recent conversation.
+
+**What is sent to OpenAI:** the system prompt (`app/agent/prompts.py` — review
+it, it is the clinic's rules), the last `AGENT_HISTORY_MESSAGES` messages of
+this conversation, and the new message. A voice note with no transcript and any
+non-text message become fixed placeholders — `[patient sent a voice note]`,
+`[patient sent a photo, file, location or other non-text message]` — never the
+payload behind them. **Never sent:** the patient's WhatsApp profile name, their
+phone number, any `wamid`, and no tenant, contact, conversation or inbox id.
+
+**Settings** (all in `.env.example`, all optional): `OPENAI_API_KEY`,
+`OPENAI_CHAT_MODEL` (no default — model names come from `.env`, never from
+code), `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_OUTPUT_TOKENS`,
+`AGENT_HISTORY_MESSAGES`, `AGENT_FALLBACK_REPLY`. With the key or the model
+blank the app still boots and the worker says so at startup — every reply is
+then the fallback.
+
+**The fallback** (`AGENT_FALLBACK_REPLY`) is what the patient gets when no AI
+reply can be produced: no credit, OpenAI down for all five tries, a blank
+setting, a truncated or filtered completion. It goes out through the same
+exactly-once path as any reply, so a retry re-sends the stored text and never
+asks the model again.
+
+**A dead letter whose `error` starts with `openai_` belongs to an event that
+WAS answered** — with the fallback. Its inbox row is `PROCESSED`, not `FAILED`.
+The dead letter is there so a human hears that the AI could not answer, not
+because the patient was left in silence. An event can carry two dead letters
+(one `openai_`, one `http_`) when the fallback itself was then refused by Meta:
+two different things went wrong, and each has a different fix.
+
+Token counts and the prompt version are on the `reply generated` line. Never
+paste a prompt or a reply into an issue.
 
 ### Reading the tables
 
@@ -182,8 +218,9 @@ docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select
 docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select job_name, source_event_id, error, attempts, created_at from dead_letter_jobs order by created_at desc limit 10;"
 ```
 
-**Select ids, statuses and reason codes. Never `payload`, never `text`, and never
-`provider_event_id`** (hard rule 8). A terminal transcript is as public as a log:
+**Select ids, statuses and reason codes. Never `payload`, never `text`, never
+`provider_event_id`, and never paste a prompt or a generated reply into an
+issue** (hard rule 8). A terminal transcript is as public as a log:
 `payload` and `text` hold the patient's words, and a `provider_event_id` is a
 `wamid`, which is base64 and commonly decodes to include their phone number.
 
@@ -203,3 +240,11 @@ once the lease expires (`JOB_TIMEOUT_SECONDS + JOB_LEASE_MARGIN_SECONDS`).
 | `stored_no_reply` | the message was stored but its type is not in `WHATSAPP_REPLY_TO_TYPES` (default: `text` only). |
 | `dropped_not_ai_active` | a human holds the conversation, or it is closed (hard rule 7). |
 | `status_before_wamid` in a dead letter | a delivery status for a message this tenant never sent — often a message sent by hand from the Meta Business app. |
+| `replied_fallback` + `openai_insufficient_quota` | the OpenAI account has no credit. Permanent: every reply falls back until it is topped up. |
+| `replied_fallback` + `openai_model_unset` / `openai_api_key_unset` | the setting is blank in `.env`. The worker's startup log says so too. |
+| `replied_fallback` + `openai_http_404_…` | `OPENAI_CHAT_MODEL` names a model this key cannot use. |
+| `replied_fallback` + `openai_http_401_…` | `OPENAI_API_KEY` is wrong or revoked. |
+| `replied_fallback` + `openai_reply_truncated` / `openai_empty_reply` | `OPENAI_MAX_OUTPUT_TOKENS` is too small for the model — likely a reasoning model spending the budget on hidden reasoning. |
+| `retrying … reason=openai_http_429` or `openai_timeout` | OpenAI is rate-limiting or slow. Retried with backoff; the fifth failure falls back. |
+| `retrying … reason=http_timeout` | the Meta send passed `META_SEND_TIMEOUT_SECONDS`. Meta may still have accepted it. |
+| `dropped_not_ai_active` with no `reply generated` line | a human held the conversation before the job started: the model was not called. |

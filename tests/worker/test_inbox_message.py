@@ -5,6 +5,7 @@ of what is asserted here is "how many times did we send?".
 """
 
 import asyncio
+import json
 import logging
 
 import httpx
@@ -19,8 +20,9 @@ from app.db.enums import (
     MessageStatus,
 )
 from app.db.models import Contact, Conversation, DeadLetterJob, Message, WebhookInbox
-from app.worker.jobs.inbox import ACK_TEXT, process_inbox_event
+from app.worker.jobs.inbox import process_inbox_event
 from tests.db import factories as dbf
+from tests.integrations.fakes import AI_REPLY, FakeChatClient, ok, permanent, retryable
 from tests.whatsapp_factories import (
     PATIENT_TEXT,
     PHONE_NUMBER_ID,
@@ -232,7 +234,7 @@ async def test_a_text_message_sends_one_reply_and_stores_it_as_sent_with_a_wamid
     assert outcome == "replied"
     assert transport.sends == 1
     reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
-    assert reply.text == ACK_TEXT
+    assert reply.text == AI_REPLY
     assert reply.status == MessageStatus.SENT.value
     assert reply.provider_message_id == wamid(9)
     assert reply.sent_at is not None
@@ -508,6 +510,11 @@ async def test_the_state_is_re_read_immediately_before_the_send(
     so the re-read had nothing stale to find, and the test passed against a
     re-read that never went to the database.
 
+    VS-005 note: this now proves the FIRST of two hard-rule-7 reads - the one
+    inside T1, which keeps a conversation a human already holds from costing a
+    model call at all. The SECOND read, the one that actually protects the send,
+    is proved by test_a_takeover_during_generation_drops_the_reply.
+
     The hook is on get_or_create_open's RETURN and not on the step after it:
     MessageRepository.add updates conversations.last_inbound_at, which takes a row
     lock, so an independent session flipping the state after that point blocks on
@@ -567,9 +574,656 @@ async def test_a_dropped_reply_logs_ids_only(sessionmaker_for, caplog):
         assert value not in "\n".join(dropped)
 
 
-async def test_no_log_line_from_the_message_path_contains_patient_content(sessionmaker_for, caplog):
+async def test_no_log_line_from_the_message_path_contains_patient_or_generated_content(
+    sessionmaker_for, caplog
+):
+    """VS-005 adds two more things that must never be logged: the text the model
+    wrote, and the system prompt it was written from."""
     with caplog.at_level(logging.DEBUG):
-        await _run(sessionmaker_for, Meta())
+        await _run(sessionmaker_for, Meta(), chat=FakeChatClient(ok()))
 
-    for value in (PATIENT_TEXT, PROFILE_NAME, phone(1), wamid(1), wamid(9)):
+    for value in (
+        PATIENT_TEXT,
+        PROFILE_NAME,
+        phone(1),
+        wamid(1),
+        wamid(9),
+        AI_REPLY,
+        "You are the WhatsApp receptionist",
+    ):
         assert value not in caplog.text
+
+
+# --- VS-005: the generated reply --------------------------------------------
+
+
+async def _staff_takeover(second_session_factory):
+    """A staff member taking the conversation over, from an independent session.
+
+    SET LOCAL lock_timeout is the second half of every test that uses this: if
+    the job still held T1's row lock on the conversation - MessageRepository.add
+    updates last_inbound_at - this UPDATE would block for the whole of the model
+    call. With the timeout it fails in two seconds and names the bug, instead of
+    hanging the suite.
+    """
+    async with second_session_factory() as staff:
+        await staff.execute(sa.text("SET LOCAL lock_timeout = '2s'"))
+        await staff.execute(
+            sa.update(Conversation).values(state=ConversationState.HUMAN_ACTIVE.value)
+        )
+        await staff.commit()
+
+
+async def test_a_text_message_is_answered_with_the_generated_text(sessionmaker_for):
+    """ACK_TEXT is gone: the reply is whatever the model wrote."""
+    transport = Meta()
+    chat = FakeChatClient(ok())
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=chat)
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == AI_REPLY
+    assert json.loads(transport.requests[0].content)["text"]["body"] == AI_REPLY
+
+
+async def test_the_model_sees_the_system_prompt_then_the_history_then_the_new_message(
+    sessionmaker_for,
+):
+    """Requirement 5, at the job level: roles, order, and the answered message last."""
+    transport = Meta(ok_response(8), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(ok())
+
+    await _run(sessionmaker_for, transport, message_payload(1), settings, n=1, chat=chat)
+    await _run(
+        sessionmaker_for,
+        transport,
+        message_payload(1, id=wamid(2), text={"body": "and one more thing"}),
+        settings,
+        n=2,
+        chat=chat,
+    )
+
+    second = chat.calls[1]
+    assert [m.role for m in second] == ["system", "user", "assistant", "user"]
+    assert second[0].content.startswith("You are the WhatsApp receptionist")
+    assert [m.content for m in second[1:]] == [PATIENT_TEXT, AI_REPLY, "and one more thing"]
+
+
+async def test_a_failed_reply_is_left_out_of_the_history(sessionmaker_for):
+    """Plan conflict C9's other half: a reply that never reached the patient is
+    not something the clinic said."""
+    transport = Meta(httpx.Response(400, json={"error": {"code": 131030}}), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(ok())
+
+    await _run(sessionmaker_for, transport, message_payload(1), settings, n=1, chat=chat)
+    await _run(
+        sessionmaker_for,
+        transport,
+        message_payload(1, id=wamid(2), text={"body": "hello again"}),
+        settings,
+        n=2,
+        chat=chat,
+    )
+
+    second = chat.calls[1]
+    assert [m.role for m in second] == ["system", "user", "user"]
+    assert AI_REPLY not in [m.content for m in second]
+
+
+async def test_the_reply_row_holds_the_generated_text_before_the_send(
+    sessionmaker_for, second_session_factory
+):
+    """VS-004's commit boundary, now carrying the decision.
+
+    Once a text is reserved, that text IS the reply: a retry sends what is in
+    the row and never asks the model again.
+    """
+    seen = []
+
+    async def peek(request):
+        async with second_session_factory() as other:
+            rows = (
+                await other.scalars(
+                    sa.select(Message).where(Message.direction == MessageDirection.OUTBOUND.value)
+                )
+            ).all()
+            seen.append([(r.status, r.provider_message_id, r.text) for r in rows])
+
+    await _run(sessionmaker_for, Meta(hook=peek), chat=FakeChatClient(ok()))
+
+    assert seen == [[(MessageStatus.QUEUED.value, None, AI_REPLY)]]
+
+
+async def test_a_retry_after_a_failed_send_sends_the_stored_text_and_never_calls_the_model_again(
+    sessionmaker_for,
+):
+    """Requirement 2, verbatim. No second bill, and no different second answer."""
+    from arq.worker import Retry
+
+    transport = Meta(httpx.Response(500, json={"error": {"code": 1}}), ok_response(9))
+    settings = worker_settings()
+    # The second scripted result is DIFFERENT on purpose: if the job asked
+    # again, the reply row and the second send would disagree with the first.
+    chat = FakeChatClient(ok(), ok("a different second answer"))
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(Retry):
+        await process_inbox_event(ctx, str(event_id))
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    assert transport.sends == 2
+    bodies = [json.loads(r.content)["text"]["body"] for r in transport.requests]
+    assert bodies == [AI_REPLY, AI_REPLY]
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == AI_REPLY
+
+
+async def test_a_reply_reserved_by_an_earlier_try_is_sent_as_stored(sessionmaker_for):
+    """Seeded rather than simulated: whatever put the row there, its text is
+    the reply and the model is not consulted."""
+    transport = Meta(ok_response(8), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(ok())
+    await _run(sessionmaker_for, transport, message_payload(1), settings, n=1, chat=chat)
+
+    # A second inbound message with a reply row already reserved for it.
+    async with sessionmaker_for() as session:
+        conversation = (await session.scalars(sa.select(Conversation))).one()
+        inbound = dbf.make_message(
+            conversation, text="second message", provider_message_id=wamid(2)
+        )
+        session.add(inbound)
+        await session.flush()
+        reserved = dbf.make_reply(conversation, inbound, text="reserved by an earlier try")
+        session.add(reserved)
+        await session.commit()
+
+    chat.calls.clear()
+    _, outcome = await _run(
+        sessionmaker_for,
+        transport,
+        message_payload(1, id=wamid(2), text={"body": "second message"}),
+        settings,
+        n=2,
+        chat=chat,
+    )
+
+    assert outcome == "replied"
+    assert chat.calls == []
+    sent = json.loads(transport.requests[-1].content)["text"]["body"]
+    assert sent == "reserved by an earlier try"
+
+
+async def test_a_takeover_during_generation_drops_the_reply(
+    sessionmaker_for, second_session_factory
+):
+    """The slice's acceptance test.
+
+    The model call is now the longest thing the job does, so the hard-rule-7
+    check that protects the send has to come AFTER it. This flips the state
+    from an independent session while the fake model is "thinking".
+
+    The lock_timeout inside _staff_takeover is the other half: if the job still
+    held T1's row lock on the conversation, the staff UPDATE would fail in two
+    seconds instead of hanging the suite - which is how a regression here
+    announces itself.
+    """
+    transport = Meta()
+
+    async def takeover(messages):
+        await _staff_takeover(second_session_factory)
+
+    chat = FakeChatClient(ok(), hook=takeover)
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=chat)
+
+    assert outcome == "dropped_not_ai_active"
+    assert len(chat.calls) == 1
+    assert transport.sends == 0
+    assert await _all(sessionmaker_for, Message, direction="OUTBOUND") == []
+
+
+async def test_a_takeover_during_the_meta_send_is_not_blocked(
+    sessionmaker_for, second_session_factory
+):
+    """No transaction is open during the Meta call either.
+
+    The reply was already on its way when the takeover happened, so it
+    completes - what this test proves is that the staff UPDATE did not have to
+    wait for it.
+    """
+
+    async def takeover(request):
+        await _staff_takeover(second_session_factory)
+
+    transport = Meta(hook=takeover)
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=FakeChatClient(ok()))
+
+    assert outcome == "replied"
+    assert transport.sends == 1
+    async with sessionmaker_for() as session:
+        conversation = (await session.scalars(sa.select(Conversation))).one()
+        assert conversation.state == ConversationState.HUMAN_ACTIVE.value
+
+
+async def test_a_conversation_a_human_holds_is_not_sent_to_the_model(sessionmaker_for):
+    """Plan conflict S4's first read: no model call, and none of the patient's
+    words sent to OpenAI, for a conversation the AI is not running."""
+    transport = Meta(ok_response(8), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(ok())
+    await _run(sessionmaker_for, transport, message_payload(1), settings, n=1, chat=chat)
+    await _set_state(sessionmaker_for, ConversationState.HUMAN_ACTIVE)
+    chat.calls.clear()
+
+    _, outcome = await _run(
+        sessionmaker_for, transport, message_payload(1, id=wamid(2)), settings, n=2, chat=chat
+    )
+
+    assert outcome == "dropped_not_ai_active"
+    assert chat.calls == []
+
+
+async def test_a_reply_reserved_before_a_takeover_is_marked_failed_not_left_queued(
+    sessionmaker_for,
+):
+    """Plan conflict C9.
+
+    A row left QUEUED forever would reach later prompts as something the clinic
+    said. FAILED is also hard rule 5's shape: nothing claims the patient was
+    told it.
+    """
+    transport = Meta(ok_response(8))
+    settings = worker_settings()
+    chat = FakeChatClient(ok())
+    await _run(sessionmaker_for, transport, message_payload(1), settings, n=1, chat=chat)
+
+    async with sessionmaker_for() as session:
+        conversation = (await session.scalars(sa.select(Conversation))).one()
+        inbound = dbf.make_message(conversation, text="second", provider_message_id=wamid(2))
+        session.add(inbound)
+        await session.flush()
+        session.add(dbf.make_reply(conversation, inbound, text="never sent"))
+        await session.commit()
+    await _set_state(sessionmaker_for, ConversationState.HUMAN_ACTIVE)
+    chat.calls.clear()
+
+    _, outcome = await _run(
+        sessionmaker_for,
+        transport,
+        message_payload(1, id=wamid(2), text={"body": "second"}),
+        settings,
+        n=2,
+        chat=chat,
+    )
+
+    assert outcome == "dropped_not_ai_active"
+    assert chat.calls == []
+    stranded = await _one(sessionmaker_for, Message, text="never sent")
+    assert stranded.status == MessageStatus.FAILED.value
+    assert stranded.provider_message_id is None
+
+
+async def test_the_job_never_reads_the_state_through_conversation_get(
+    sessionmaker_for, monkeypatch
+):
+    """Requirement 2's warning, made executable.
+
+    ConversationRepository.get selects the mapped entity, which in a session
+    that has already loaded the conversation is answered from SQLAlchemy's
+    identity map - so a "re-read" through it would never see a commit made by
+    anyone else, which is the only thing it exists to see.
+    """
+    from app.db.repositories import ConversationRepository
+
+    def explode(self, conversation_id):
+        raise AssertionError("hard rule 7 must read current_state, never get")
+
+    monkeypatch.setattr(ConversationRepository, "get", explode)
+
+    transport = Meta(ok_response(8), ok_response(9))
+    settings = worker_settings()
+    _, replied = await _run(sessionmaker_for, transport, message_payload(1), settings, n=1)
+    await _set_state(sessionmaker_for, ConversationState.HUMAN_ACTIVE)
+    _, dropped = await _run(
+        sessionmaker_for, transport, message_payload(1, id=wamid(2)), settings, n=2
+    )
+
+    assert (replied, dropped) == ("replied", "dropped_not_ai_active")
+
+
+async def test_a_retryable_generation_failure_with_tries_left_retries_and_reserves_nothing(
+    sessionmaker_for,
+):
+    """Nothing is reserved, so the next try starts clean and asks again.
+
+    This stays true after Task 7, which only changes what happens on the LAST
+    try.
+    """
+    from arq.worker import Retry
+
+    with pytest.raises(Retry):
+        await _run(sessionmaker_for, Meta(), chat=FakeChatClient(retryable()), job_try=1)
+
+    assert await _all(sessionmaker_for, Message, direction="OUTBOUND") == []
+    assert await _all(sessionmaker_for, DeadLetterJob) == []
+    row = await _one(sessionmaker_for, WebhookInbox)
+    assert row.status == InboxStatus.PROCESSING.value
+    assert row.locked_until is None
+
+
+async def test_a_permanent_generation_failure_sends_the_fallback_on_the_first_try(
+    sessionmaker_for,
+):
+    """Requirement 4. No credit is not something a retry can fix, so the patient
+    is answered now rather than 75 seconds of backoff later."""
+    transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
+
+    _, outcome = await _run(sessionmaker_for, transport, None, settings, chat=chat, job_try=1)
+
+    assert outcome == "replied_fallback"
+    assert len(chat.calls) == 1
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert letter.error == "openai_insufficient_quota"
+    assert letter.attempts == 1
+    assert (await _one(sessionmaker_for, WebhookInbox)).status == InboxStatus.PROCESSED.value
+
+
+async def test_the_generation_log_line_carries_codes_counts_and_the_row_id_only(
+    sessionmaker_for, caplog
+):
+    """Plan assumption A5: one line per generation, and one grep for AI problems."""
+    with caplog.at_level(logging.INFO):
+        event_id, _ = await _run(sessionmaker_for, Meta(), chat=FakeChatClient(ok()))
+
+    lines = [r.getMessage() for r in caplog.records if "reply generated" in r.getMessage()]
+    assert len(lines) == 1
+    line = lines[0]
+    for fragment in (
+        f"event_id={event_id}",
+        "outcome=SUCCESS",
+        "reason=ok",
+        "prompt_version=vs005-1",
+        "prompt_tokens=11",
+        "completion_tokens=7",
+    ):
+        assert fragment in line, fragment
+    for secret in (PATIENT_TEXT, AI_REPLY, "You are the WhatsApp receptionist"):
+        assert secret not in line
+
+
+# --- VS-005: when the model fails -------------------------------------------
+
+
+async def test_the_next_try_after_a_generation_failure_generates_again(sessionmaker_for):
+    """Nothing was reserved, so the next try starts clean."""
+    from arq.worker import Retry
+
+    transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(retryable(), ok())
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(Retry):
+        await process_inbox_event(ctx, str(event_id))
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 2
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == AI_REPLY
+    assert await _all(sessionmaker_for, DeadLetterJob) == []
+
+
+async def test_a_retryable_generation_failure_on_the_last_try_sends_the_fallback(sessionmaker_for):
+    """Requirement 4: out of tries is answered, not silently abandoned.
+
+    job_try == job_max_tries is exactly the comparison the envelope makes to
+    decide "dead-letter instead of defer", which is why EventContext carries
+    job_try (plan assumption A7) - the two cannot disagree about which try is
+    last.
+    """
+    transport = Meta()
+    settings = worker_settings()
+    chat = FakeChatClient(retryable())
+
+    _, outcome = await _run(
+        sessionmaker_for, transport, None, settings, chat=chat, job_try=settings.job_max_tries
+    )
+
+    assert outcome == "replied_fallback"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+    assert reply.provider_message_id == wamid(9)
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert letter.error == "openai_http_503"
+    assert letter.attempts == settings.job_max_tries
+    assert (await _one(sessionmaker_for, WebhookInbox)).status == InboxStatus.PROCESSED.value
+
+
+async def test_an_unset_model_sends_the_fallback_without_calling_openai(sessionmaker_for):
+    """Requirement 7, end to end, through the REAL client.
+
+    The fake cannot prove this one: what is being asserted is that no HTTP
+    request is made at all when OPENAI_CHAT_MODEL is blank.
+    """
+    import httpx2
+
+    from app.integrations.openai.chat import OpenAIChatClient
+
+    openai_requests: list[httpx2.Request] = []
+
+    async def record(request: httpx2.Request) -> httpx2.Response:
+        openai_requests.append(request)
+        return httpx2.Response(500, json={"error": {"message": "should never happen"}})
+
+    settings = worker_settings(
+        openai_api_key="sk-test-not-a-real-one",
+        openai_chat_model="",
+    )
+    chat = OpenAIChatClient(
+        settings, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(record))
+    )
+    transport = Meta()
+
+    _, outcome = await _run(sessionmaker_for, transport, None, settings, chat=chat)
+
+    assert outcome == "replied_fallback"
+    assert openai_requests == []
+    assert transport.sends == 1
+    body = json.loads(transport.requests[0].content)["text"]["body"]
+    assert body == settings.agent_fallback_reply
+    assert (await _one(sessionmaker_for, DeadLetterJob)).error == "openai_model_unset"
+
+
+async def test_the_fallback_and_its_dead_letter_are_committed_together_before_the_send(
+    sessionmaker_for, second_session_factory
+):
+    """Plan conflict C7's reason for putting the dead letter in T1b.
+
+    Written earlier, in its own transaction, a crash before the reservation
+    would leave a dead letter for a failure that had since healed. Written
+    later, with the wamid, a crash during the send would lose it. In T1b the
+    two facts - "the fallback is the reply" and "generation failed for this
+    reason" - commit together or not at all.
+    """
+    seen = []
+    settings = worker_settings()
+
+    async def peek(request):
+        async with second_session_factory() as other:
+            replies = (
+                await other.scalars(
+                    sa.select(Message).where(Message.direction == MessageDirection.OUTBOUND.value)
+                )
+            ).all()
+            letters = (await other.scalars(sa.select(DeadLetterJob))).all()
+            seen.append(
+                (
+                    [(r.status, r.text) for r in replies],
+                    [letter.error for letter in letters],
+                )
+            )
+
+    await _run(sessionmaker_for, Meta(hook=peek), None, settings, chat=FakeChatClient(permanent()))
+
+    assert seen == [
+        (
+            [(MessageStatus.QUEUED.value, settings.agent_fallback_reply)],
+            ["openai_insufficient_quota"],
+        )
+    ]
+
+
+async def test_a_crash_after_the_fallback_is_reserved_neither_loses_nor_repeats_its_dead_letter(
+    sessionmaker_for,
+):
+    """The exactly-once property the T1b placement buys.
+
+    A plain RuntimeError from the transport is a crash, not a Meta failure: it
+    escapes the envelope's two except blocks entirely, which is the closest a
+    test can get to the process being killed mid-send.
+    """
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
+    crashed = {"done": False}
+
+    async def crash_once(request):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("the worker died mid-send")
+
+    transport = Meta(hook=crash_once)
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(RuntimeError):
+        await process_inbox_event(ctx, str(event_id))
+
+    # The lease is still held by the dead run; clear it the way VS-004's tests do.
+    async with sessionmaker_for() as session:
+        await session.execute(
+            sa.update(WebhookInbox).where(WebhookInbox.id == event_id).values(locked_until=None)
+        )
+        await session.commit()
+
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    # `replied`, not `replied_fallback`: the outcome code says what THIS run
+    # did, and this run sent a stored reply without generating anything. The
+    # dead letter written by the crashed run is where the generation failure is
+    # recorded - which is the whole point of committing it with the reservation.
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    letters = await _all(sessionmaker_for, DeadLetterJob)
+    assert [letter.error for letter in letters] == ["openai_insufficient_quota"]
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.text == settings.agent_fallback_reply
+    assert reply.status == MessageStatus.SENT.value
+
+
+async def test_a_retried_fallback_send_does_not_call_the_model_or_write_a_second_dead_letter(
+    sessionmaker_for,
+):
+    """The fallback goes through the SAME exactly-once path as any reply."""
+    from arq.worker import Retry
+
+    transport = Meta(httpx.Response(500, json={"error": {"code": 1}}), ok_response(9))
+    settings = worker_settings()
+    chat = FakeChatClient(permanent())
+    event_id = await store_event(sessionmaker_for, message_payload())
+    ctx = job_context(sessionmaker_for, meta_client(transport, settings), settings, chat=chat)
+
+    with pytest.raises(Retry):
+        await process_inbox_event(ctx, str(event_id))
+    ctx["job_try"] = 2
+    outcome = await process_inbox_event(ctx, str(event_id))
+
+    assert outcome == "replied"
+    assert len(chat.calls) == 1
+    assert len(await _all(sessionmaker_for, DeadLetterJob)) == 1
+    bodies = [json.loads(r.content)["text"]["body"] for r in transport.requests]
+    assert bodies == [settings.agent_fallback_reply] * 2
+
+
+async def test_a_fallback_refused_by_meta_leaves_two_dead_letters_with_two_reasons(
+    sessionmaker_for,
+):
+    """Two different things went wrong, and each has a different fix."""
+    transport = Meta(httpx.Response(400, json={"error": {"code": 131030}}))
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=FakeChatClient(permanent()))
+
+    assert outcome == "dead_lettered"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.status == MessageStatus.FAILED.value
+    errors = sorted(letter.error for letter in await _all(sessionmaker_for, DeadLetterJob))
+    assert errors == ["http_400 code_131030", "openai_insufficient_quota"]
+
+
+async def test_a_generation_failure_then_a_takeover_keeps_the_dead_letter_and_sends_nothing(
+    sessionmaker_for, second_session_factory
+):
+    """Hard rule 7 still wins over the fallback - and the failure is still
+    recorded, because it still happened and somebody still has to fix it."""
+
+    async def takeover(messages):
+        await _staff_takeover(second_session_factory)
+
+    transport = Meta()
+    chat = FakeChatClient(permanent(), hook=takeover)
+
+    _, outcome = await _run(sessionmaker_for, transport, chat=chat)
+
+    assert outcome == "dropped_not_ai_active"
+    assert transport.sends == 0
+    assert await _all(sessionmaker_for, Message, direction="OUTBOUND") == []
+    assert (await _one(sessionmaker_for, DeadLetterJob)).error == "openai_insufficient_quota"
+
+
+async def test_a_reply_that_runs_out_of_send_tries_is_marked_failed(sessionmaker_for):
+    """Plan conflict C9, on the Meta side.
+
+    The envelope is about to dead-letter this event, so no later try will ever
+    send this row. Left QUEUED it would reach later prompts as something the
+    clinic said.
+    """
+    transport = Meta(httpx.Response(500, json={"error": {"code": 1}}))
+    settings = worker_settings()
+
+    _, outcome = await _run(
+        sessionmaker_for, transport, None, settings, job_try=settings.job_max_tries
+    )
+
+    assert outcome == "dead_lettered"
+    reply = await _one(sessionmaker_for, Message, direction=MessageDirection.OUTBOUND.value)
+    assert reply.status == MessageStatus.FAILED.value
+    assert reply.provider_message_id is None
+
+
+async def test_a_generation_dead_letter_carries_codes_and_references_only(sessionmaker_for):
+    """Hard rule 8. dead_letter_jobs is a table people open casually to triage."""
+    _, _ = await _run(sessionmaker_for, Meta(), chat=FakeChatClient(permanent()))
+
+    letter = await _one(sessionmaker_for, DeadLetterJob)
+    assert set(letter.payload) == {"inbox_row_id", "kind", "phone_number_id", "job_try"}
+    assert letter.error == "openai_insufficient_quota"
+    assert letter.tenant_id == dbf.TENANT_A
+    serialised = f"{letter.payload}{letter.error}{letter.source_event_id}{letter.job_name}"
+    for secret in (PATIENT_TEXT, AI_REPLY, wamid(1), wamid(9), PROFILE_NAME):
+        assert secret not in serialised

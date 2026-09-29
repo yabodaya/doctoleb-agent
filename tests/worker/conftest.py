@@ -29,6 +29,7 @@ from tests.db.conftest import (  # noqa: F401  (re-exported fixtures)
     second_session_factory,
     test_database_url,
 )
+from tests.integrations.fakes import FakeChatClient
 from tests.whatsapp_factories import PHONE_NUMBER_ID, contact, phone, text_message, wamid
 
 ACCESS_TOKEN = "test-access-token-not-a-real-one"
@@ -184,6 +185,10 @@ def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None
         "settings": settings,
         "sessionmaker": sessionmaker,
         "meta": meta,
+        # A fake model by default, so every VS-004 test runs unchanged and no
+        # test can reach OpenAI. A test that cares passes chat=FakeChatClient(...)
+        # or the real OpenAIChatClient over an httpx2.MockTransport.
+        "chat": FakeChatClient(),
         "resolver": ConfigTenantResolver.from_settings(settings),
         "job_try": 1,
     }
