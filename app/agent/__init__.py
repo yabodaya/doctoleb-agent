@@ -13,6 +13,7 @@ from app.agent.core import (
     build_messages,
     process_turn,
 )
+from app.agent.guard import allowed_claims, claims_in, compose_reply, unconfirmed_claims
 from app.agent.history import (
     NON_TEXT_PLACEHOLDER,
     VOICE_NOTE_PLACEHOLDER,
@@ -60,11 +61,15 @@ __all__ = [
     "ToolContext",
     "ToolExecutionStatus",
     "Turn",
+    "allowed_claims",
     "build_messages",
+    "claims_in",
     "clock_message",
+    "compose_reply",
     "content_for",
     "default_registry",
     "process_turn",
     "to_chat_messages",
+    "unconfirmed_claims",
     "utc_now",
 ]

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.agent.clock import Clock, clock_message
+from app.agent.guard import unconfirmed_claims
 from app.agent.history import HistoryEntry, content_for, to_chat_messages
 from app.agent.loop import LoopState, run_loop
 from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION
@@ -220,6 +221,21 @@ async def process_turn(turn: Turn, chat: ChatClient, runtime: AgentRuntime) -> A
             outcome, reason, reply_text = await run_loop(
                 build_messages(turn, now), chat, runtime.registry, ctx, state
             )
+        if outcome is ChatOutcome.SUCCESS:
+            # G2 (V4). The reply is checked against what the turn's own change
+            # entitles it to say - BEFORE any receipt is appended, so our own ✅ is
+            # never mistaken for the model's. A claim the turn cannot support is
+            # PERMANENT: the job sends AGENT_FALLBACK_REPLY plus an executed
+            # success's receipt, and dead-letters the reason (hard rule 5).
+            #
+            # The outcome is KEPT on the result: the change really happened and
+            # still has to be recorded and receipted, whatever the model wrote
+            # about it.
+            unsupported = unconfirmed_claims(
+                reply_text, patient.outcome if patient is not None else None
+            )
+            if unsupported:
+                return result(ChatOutcome.PERMANENT, "agent_unconfirmed_claim")
         return result(outcome, reason, reply_text)
     except TimeoutError:
         if not deadline.expired():
