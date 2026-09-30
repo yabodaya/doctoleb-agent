@@ -114,6 +114,10 @@ class ToolExecutionStatus(StrEnum):
     Every call the model made gets a row, executed or not, which is why SKIPPED
     exists: calls arriving on the last allowed model response, or past the
     per-turn cap, are recorded and not run.
+
+    VS-007 adds two, and the CHECK constraint widens with them (migration
+    b919820bf52e). `app/agent/tools/base.py` mirrors this enum and a test keeps
+    the two equal, so they must always be added together.
     """
 
     OK = "OK"
@@ -121,3 +125,55 @@ class ToolExecutionStatus(StrEnum):
     UNKNOWN_TOOL = "UNKNOWN_TOOL"  # the model named a tool that is not registered
     ERROR = "ERROR"  # the tool ran and failed (booking error, crash, deadline)
     SKIPPED = "SKIPPED"  # recorded but never executed
+    # VS-007, V6. A booking-changing call whose outcome is UNKNOWN: it timed out,
+    # lost its connection, or was cut off by the turn deadline. Deliberately not
+    # ERROR: an error means "it did not happen", and that is the one thing we
+    # cannot say here (hard rule 5).
+    UNCERTAIN = "UNCERTAIN"
+    # VS-007, V3/V12/V15. OUR code declined to run it: the confirmation gate, the
+    # one-change-per-message rule, or too little turn budget left. Not the model's
+    # mistake and not the service's - so neither SKIPPED nor ERROR would be true.
+    REFUSED = "REFUSED"
+
+
+class BookingActionKind(StrEnum):
+    """Which kind of change a `booking_actions` row is about (VS-007, V2).
+
+    Imported from here by `app/agent/tools/base.py`, exactly as `MessageModality`
+    already is: a vocabulary is not database access, and the forbidden-import test
+    allows `app.db.enums` for that reason. Duplicating it a second time (as
+    `ToolExecutionStatus` had to be, because it is a STATUS the agent produces)
+    would be two places to forget.
+    """
+
+    BOOK = "BOOK"
+    RESCHEDULE = "RESCHEDULE"
+    CANCEL = "CANCEL"
+
+
+class BookingActionStatus(StrEnum):
+    """How far a prepared change got (VS-007, V2).
+
+    PENDING     prepared - a hold, or a prepared cancellation - and waiting for
+                the patient. The ONLY status that can be confirmed, and only
+                under V3's gate.
+    DONE        executed; the Booking Service said success.
+    FAILED      executing it failed definitively: HOLD_EXPIRED, SLOT_TAKEN,
+                NOT_FOUND or UNAVAILABLE.
+    UNCERTAIN   the service's answer is unknown. For an executed change a
+                `booking_uncertain` dead letter exists, so a human checks.
+    SUPERSEDED  replaced by a newer prepared change, or voided - a takeover, the
+                reply guard firing, or a fallback reply.
+    EXPIRED     a hold whose expiry passed before the patient confirmed, on the
+                INJECTED clock.
+
+    A partial unique index allows at most one PENDING row per conversation, which
+    is what makes "the prepared change" a single thing rather than a set.
+    """
+
+    PENDING = "PENDING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    UNCERTAIN = "UNCERTAIN"
+    SUPERSEDED = "SUPERSEDED"
+    EXPIRED = "EXPIRED"

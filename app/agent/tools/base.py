@@ -30,6 +30,10 @@ class ToolExecutionStatus(StrEnum):
     `app/db/` at all (hard rule 3, enforced by a test). A test keeps the two
     equal, so drift is a failing test rather than a row PostgreSQL rejects
     inside a job.
+
+    VS-007 adds UNCERTAIN and REFUSED here and in `app.db.enums` in the same
+    commit as the CHECK-widening migration, because the equality test means one
+    without the other cannot pass.
     """
 
     OK = "OK"
@@ -37,6 +41,12 @@ class ToolExecutionStatus(StrEnum):
     UNKNOWN_TOOL = "UNKNOWN_TOOL"
     ERROR = "ERROR"
     SKIPPED = "SKIPPED"
+    # A booking-changing call whose outcome is unknown (V6). Not ERROR: an error
+    # means "it did not happen", which is the one thing we cannot say.
+    UNCERTAIN = "UNCERTAIN"
+    # Our own code declined to run it: the confirmation gate, one change per
+    # message, or too little turn budget left (V3, V12, V15).
+    REFUSED = "REFUSED"
 
 
 class NoArguments(BaseModel):

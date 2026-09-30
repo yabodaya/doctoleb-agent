@@ -173,7 +173,7 @@ async def clean_database(request, db_engine):  # noqa: F811
             sa.text(
                 # tool_executions before agent_runs is not strictly needed -
                 # one TRUNCATE handles the FK - but the order documents it.
-                "TRUNCATE tool_executions, agent_runs, webhook_inbox, "
+                "TRUNCATE booking_actions, tool_executions, agent_runs, webhook_inbox, "
                 "dead_letter_jobs, messages, conversations, contact_identities, contacts"
             )
         )

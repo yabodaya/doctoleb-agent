@@ -5,6 +5,7 @@ import sqlalchemy as sa
 from app.db.base import Base
 from app.db.models import (
     AgentRun,
+    BookingAction,
     Contact,
     ContactIdentity,
     Conversation,
@@ -23,6 +24,7 @@ ALL_MODELS = [
     DeadLetterJob,
     AgentRun,
     ToolExecution,
+    BookingAction,
 ]
 
 
@@ -52,6 +54,10 @@ def test_the_slice_creates_exactly_these_tables():
         # doctors, services or slots, which belong to the Booking Service.
         "agent_runs",
         "tool_executions",
+        # VS-007. Ids, codes and one operational expiry - the conversation's
+        # prepared change. Still no appointment data: the appointment itself
+        # belongs to the Booking Service, and only its id is referenced here.
+        "booking_actions",
     }
 
 
@@ -90,7 +96,15 @@ def test_tenant_id_is_not_null_everywhere_a_tenant_is_knowable():
     # Review Focus 7. The webhook stores the raw event before anything resolves
     # a tenant (hard rule 1), and a dead-lettered job may have died before
     # resolution, so those two are nullable. Everything else is not.
-    for model in (Contact, ContactIdentity, Conversation, Message, AgentRun, ToolExecution):
+    for model in (
+        Contact,
+        ContactIdentity,
+        Conversation,
+        Message,
+        AgentRun,
+        ToolExecution,
+        BookingAction,
+    ):
         assert model.__table__.c.tenant_id.nullable is False, model.__tablename__
     assert WebhookInbox.__table__.c.tenant_id.nullable is True
     assert DeadLetterJob.__table__.c.tenant_id.nullable is True
@@ -111,6 +125,7 @@ def test_enum_backed_columns_carry_a_named_check_constraint():
         "conversations": "ck_conversations_state_valid",
         "messages": "ck_messages_direction_valid",
         "webhook_inbox": "ck_webhook_inbox_status_valid",
+        "booking_actions": "ck_booking_actions_kind_valid",
     }
     for table_name, constraint_name in expected.items():
         table = Base.metadata.tables[table_name]

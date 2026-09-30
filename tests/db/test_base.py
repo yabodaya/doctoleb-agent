@@ -89,6 +89,15 @@ def test_enum_values_are_the_exact_strings_stored_in_the_database():
         # the per-turn cap: recorded, never executed. The model still gets a
         # tool message for it, because OpenAI requires one per tool_call_id.
         "SKIPPED",
+        # VS-007. A booking-changing call whose outcome is UNKNOWN - it timed
+        # out, lost its connection, or the turn deadline cut it. Deliberately
+        # not ERROR: an error means "it did not happen", which is the one thing
+        # we cannot say (hard rule 5). The CHECK was widened by the hand-written
+        # migration b919820bf52e.
+        "UNCERTAIN",
+        # VS-007. OUR code declined to run it: the confirmation gate, one change
+        # per message, or too little turn budget left.
+        "REFUSED",
     ]
 
 
