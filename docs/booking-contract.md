@@ -92,6 +92,11 @@ patient's phone number and the key reaches your logs. Our `webhook_inbox` row is
 in substance, and it is identical across every retry and every duplicate delivery
 of that message.
 
+The canonical body the key covers includes the patient reference of point 3, so
+the key hashes a phone number. That is safe and deliberate: SHA-256 over a random
+row UUID plus the body is one-way, so the key reveals neither the number nor
+anything else, which is what makes it safe for us to store and for you to log.
+
 We ask that keys be:
 
 - scoped **per tenant**;
@@ -119,16 +124,20 @@ A *different* patient still gets `SLOT_TAKEN` or `404`.
 
 ### 3. Patient reference
 
-An opaque string of ours. Today it is our **contact row UUID**: stable per clinic
-and per phone number, and not personal data by itself. We do **not** send a phone
-number. This is contract open question 2: please tell us whether you need one,
-and what for.
+The patient's **WhatsApp phone number**, exactly as WhatsApp gives it to us
+(digits including the country code; **exact format to be confirmed by the Booking
+Service owner** - we do not normalise it, add a `+`, or reformat it in any way).
+Because it is personal data it travels in a **header**, never in a URL or a query
+string, so it does not reach your access logs or ours.
+
+This answers contract open question 2. Please confirm the format you want, and
+tell us if you would rather have an id you issue instead.
 
 ### 4. The five calls
 
 | Call | Request | Response |
 |---|---|---|
-| `GET /appointments?patient_ref=` | the ref | `[{appointment_id, reference, doctor_id, doctor_name, start, end, status}]`, upcoming only, soonest first |
+| `GET /appointments` | the reference in an `X-Patient-Ref` header, never in the query string | `[{appointment_id, reference, doctor_id, doctor_name, start, end, status}]`, upcoming only, soonest first |
 | `POST /holds` | `{slot_id, patient_ref}` | `{hold_id, slot_id, doctor_id, doctor_name, start, end, expires_at}` |
 | `POST /appointments` | `{hold_id, patient: {ref, name}}` | one appointment, as above |
 | `POST /appointments/{id}/reschedule` | `{new_hold_id, patient_ref}` | the appointment, same `appointment_id` and same `reference` |
@@ -138,6 +147,10 @@ and what for.
 `reference` is a short code we show the patient; `doctor_name` is on every
 response so that a confirmation line needs no second read. `name` is the
 patient's own answer, sent only on `POST /appointments`; we never store it.
+
+`patient_ref` is the phone number of point 3. In the four `POST` bodies it is a
+body field; on the `GET` it is the `X-Patient-Ref` header, because a phone number
+in a query string is a phone number in an access log.
 
 ### 5. Holds
 
