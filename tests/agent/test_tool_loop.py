@@ -93,12 +93,19 @@ async def test_a_turn_without_tool_calls_is_one_model_call():
     assert result.model_calls == 1
     assert result.tool_calls == ()
     assert booking.calls == []
-    # The tools are still OFFERED, every call: the model decides it does not
-    # need them.
+    # All EIGHT tools are still OFFERED, every call: the model decides it does
+    # not need them. VS-007's four changing tools are offered on a "hello" turn
+    # too, which is why they each refuse on their own rather than relying on the
+    # model not to try (V3, V12).
     assert [s.name for s in chat.tool_specs[0]] == [
         "get_clinic_information",
         "list_doctors",
         "search_available_slots",
+        "list_my_appointments",
+        "hold_appointment_slot",
+        "book_appointment",
+        "reschedule_appointment",
+        "cancel_appointment",
     ]
 
 
@@ -597,4 +604,7 @@ async def test_the_clock_is_read_once_per_turn():
 async def test_the_result_carries_the_prompt_version():
     result = await process_turn(turn("hello"), FakeChatClient(ok()), runtime(spy()))
 
-    assert result.prompt_version == "vs006-1"
+    # vs007-1 since the booking rules were added. The version goes into every
+    # agent_runs row, so a behaviour change can be lined up with the instructions
+    # that caused it.
+    assert result.prompt_version == "vs007-1"

@@ -56,13 +56,27 @@ async def run(name: str, arguments: str | dict, *, booking=None, registry=None):
 # --------------------------------------------------------------------------
 
 
-def test_the_registry_holds_exactly_the_three_read_only_tools():
-    """The slice fixes the set at three. A fourth appearing here means either
-    scope creep or VS-007 arriving early, and both deserve a failing test."""
+def test_the_registry_holds_exactly_these_eight_tools_in_order():
+    """VS-007 fixes the set at eight: four reads, then four that change something.
+
+    A ninth appearing here means scope creep, and a missing one means a tool the
+    prompt names does not exist. The ORDER is asserted too, and it is not cosmetic:
+    the whole list goes out on every model call, so a changing order changes the
+    request between turns and defeats OpenAI's automatic prompt caching.
+
+    Each write sits immediately after the read whose output it needs -
+    `search_available_slots` before `hold_appointment_slot` (its `slot_id`),
+    `list_my_appointments` before the two tools that take an `appointment_id`.
+    """
     assert default_registry().names == (
         "get_clinic_information",
         "list_doctors",
         "search_available_slots",
+        "list_my_appointments",
+        "hold_appointment_slot",
+        "book_appointment",
+        "reschedule_appointment",
+        "cancel_appointment",
     )
 
 
@@ -550,7 +564,13 @@ def test_the_tool_specs_and_clock_template_are_pinned_to_the_prompt_version():
     from app.agent.prompts import SYSTEM_PROMPT_VERSION
 
     pinned = {
+        # vs006-1 stays as history: a tool_executions row from before the rewrite
+        # must still be explainable by the specs that produced it.
         "vs006-1": "966c838e54d036ed07a8a43973429bb7fd02e35537139e08a6578d71845c34a1",
+        # vs007-1 added deliberately: five new tools, a new sentence on the search
+        # description, and `slot_id` in the search result (V10). The clock template
+        # did not change.
+        "vs007-1": "993203847505ced39f332a19e5e463c05b751b569100a4a95af814f4f2d04586",
     }
     specs = json.dumps([asdict(spec) for spec in default_registry().specs()], sort_keys=True)
     digest = hashlib.sha256((specs + CLOCK_TEMPLATE).encode("utf-8")).hexdigest()
@@ -561,3 +581,28 @@ def test_the_tool_specs_and_clock_template_are_pinned_to_the_prompt_version():
     assert digest == pinned[SYSTEM_PROMPT_VERSION], (
         f"a tool spec or the clock template changed without a version bump; new digest is {digest}"
     )
+
+
+def test_a_tool_schema_never_carries_its_args_models_docstring():
+    """The args model's class docstring becomes the schema's top-level
+    `description`, and it must not be sent to the model.
+
+    It is written for whoever maintains the code: it names plan decisions, quotes
+    internal rules, and would compete with the tool's own description. Three of our
+    tools share `NoArguments`, so without this they would each send the model a
+    paragraph about `list_doctors` needing `extra="forbid"`.
+
+    `strip_titles` claimed to do this from VS-006 and never did; VS-007 made it
+    visible by adding five tools with longer docstrings, and `tool_schema` is the
+    fix. PROPERTY descriptions are kept - they are what steers the model.
+    """
+    for spec in default_registry().specs():
+        assert "description" not in spec.parameters, spec.name
+        assert "extra=" not in json.dumps(spec.parameters), spec.name
+        assert "plan " not in json.dumps(spec.parameters).lower(), spec.name
+
+    hold = next(s for s in default_registry().specs() if s.name == "hold_appointment_slot")
+    assert hold.parameters["properties"]["slot_id"]["description"]
+    assert next(
+        s for s in default_registry().specs() if s.name == "list_my_appointments"
+    ).parameters == {"additionalProperties": False, "properties": {}, "type": "object"}

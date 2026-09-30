@@ -95,7 +95,7 @@ async def test_a_tool_turn_records_one_run_and_its_tool_executions(sessionmaker_
     assert run.model_calls == 3
     assert run.inbox_event_id == event_id
     assert run.tenant_id == dbf.TENANT_A
-    assert run.prompt_version == "vs006-1"
+    assert run.prompt_version == "vs007-1"
     assert (run.prompt_tokens, run.completion_tokens) == (33, 21)
     assert run.duration_ms >= 0
     assert run.job_try == 1
@@ -446,7 +446,7 @@ async def test_the_generation_log_line_carries_counts_and_codes_only(sessionmake
     for fragment in (
         "outcome=SUCCESS",
         "reason=ok",
-        "prompt_version=vs006-1",
+        "prompt_version=vs007-1",
         "model_calls=3",
         "tool_calls=2",
         "tool_errors=0",

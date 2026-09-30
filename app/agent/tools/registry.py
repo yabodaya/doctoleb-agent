@@ -89,11 +89,15 @@ def dump(payload: dict[str, Any]) -> str:
 
 
 def strip_titles(schema: Any) -> Any:
-    """Pydantic's `title` keys and the model-level description, removed.
+    """Pydantic's `title` keys, removed at every depth.
 
     `model_json_schema()` puts a `title` on every property and on the model
     (plan check U5). They are noise the model pays tokens for on EVERY model
-    call, and the model-level description would compete with the tool's own.
+    call.
+
+    PROPERTY descriptions stay: they are what steers the model before it makes a
+    mistake ("a slot_id from search_available_slots, copied exactly"). Only the
+    model-level one is removed, by `tool_schema` below.
     """
     if isinstance(schema, dict):
         return {
@@ -104,6 +108,26 @@ def strip_titles(schema: Any) -> Any:
     if isinstance(schema, list):
         return [strip_titles(item) for item in schema]
     return schema
+
+
+def tool_schema(args_model: Any) -> Any:
+    """What the model is sent as a tool's `parameters`.
+
+    The args model's CLASS DOCSTRING becomes the schema's top-level
+    `description`, and it must not go out: it is written for whoever maintains the
+    code, it names plan decisions and internal rules, it would compete with the
+    tool's own description, and every tool pays for it on every model call. Two of
+    ours share `NoArguments`, so without this three tools would send the model a
+    paragraph about `list_doctors` needing `extra="forbid"`.
+
+    Property descriptions are kept. Only the model-level one is dropped, and only
+    at the top level - a nested object's description, if a tool ever has one, is
+    part of that field's guidance.
+    """
+    rendered = strip_titles(args_model.model_json_schema())
+    if isinstance(rendered, dict):
+        rendered.pop("description", None)
+    return rendered
 
 
 class ToolRegistry:
@@ -151,7 +175,7 @@ class ToolRegistry:
             ToolSpec(
                 name=tool.name,
                 description=tool.description,
-                parameters=strip_titles(tool.args_model.model_json_schema()),
+                parameters=tool_schema(tool.args_model),
             )
             for tool in self._tools
         )

@@ -966,7 +966,7 @@ async def test_the_generation_log_line_carries_codes_counts_and_the_row_id_only(
         f"event_id={event_id}",
         "outcome=SUCCESS",
         "reason=ok",
-        "prompt_version=vs006-1",
+        "prompt_version=vs007-1",
         "prompt_tokens=11",
         "completion_tokens=7",
     ):

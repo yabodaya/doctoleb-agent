@@ -33,7 +33,12 @@ DESCRIPTION = (
     "Use a doctor_id returned by list_doctors. start and end are clinic local "
     "time written YYYY-MM-DDTHH:MM, with no UTC offset. end must be after start "
     "and at most 14 days later. When the patient says morning, search from 08:00 "
-    "to 12:00; afternoon, from 12:00 to 17:00; evening, from 17:00 to 21:00."
+    "to 12:00; afternoon, from 12:00 to 17:00; evening, from 17:00 to 21:00. "
+    # VS-007's V10. The one sentence that makes a slot_id usable: it is opaque, so
+    # the model has nothing to gain by interpreting it and everything to lose by
+    # retyping it.
+    "Each time has a slot_id: to hold it, pass that slot_id to "
+    "hold_appointment_slot exactly as given."
 )
 
 
@@ -129,6 +134,15 @@ class SearchAvailableSlots:
             "searched": {"start": format_local(start), "end": format_local(end)},
             "slots": [
                 {
+                    # VS-007's V10. The id is here now, because a tool can finally
+                    # act on one. What stops the model inventing or reusing one:
+                    # the ids are opaque tokens the service issues and only it can
+                    # resolve; every id argument must match OPAQUE_ID, so "14:00
+                    # tomorrow" is refused as invalid arguments; an unknown id is
+                    # the fixed error `slot_not_found`; and the prompt forbids
+                    # writing an id into a reply, so a stale one can only come from
+                    # the model echoing itself - where it fails at the service.
+                    "slot_id": slot.slot_id,
                     # The day name because the model is often answering "what
                     # about Monday?", and a date alone makes it do weekday
                     # arithmetic it is bad at.
@@ -138,8 +152,5 @@ class SearchAvailableSlots:
                 }
                 for slot in shown
             ],
-            # No slot_id: nothing in VS-006 can use one, and an id the model can
-            # see but cannot act on invites it to claim it has reserved
-            # something (hard rule 5). VS-007 adds it with the tool that uses it.
             "more_available": len(slots) > len(shown),
         }
