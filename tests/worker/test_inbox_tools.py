@@ -219,8 +219,8 @@ async def test_a_takeover_during_a_tool_call_is_not_blocked_and_drops_the_reply(
 async def test_hitting_the_model_call_limit_sends_the_fallback_and_dead_letters(
     sessionmaker_for,
 ):
-    """D4's count limit, seen from the job. PERMANENT, so the fallback goes out
-    on the first try rather than after five."""
+    """D4's count limit - six since VS-007's V7 - seen from the job. PERMANENT, so
+    the fallback goes out on the first try rather than after five."""
     chat = FakeChatClient(wants_tools(tool_call("list_doctors", {})))
     transport = Meta()
 
@@ -234,9 +234,9 @@ async def test_hitting_the_model_call_limit_sends_the_fallback_and_dead_letters(
     assert letter.error == "agent_max_model_calls"
     run = await _one(sessionmaker_for, AgentRun)
     assert run.outcome == "PERMANENT"
-    assert run.model_calls == 4
+    assert run.model_calls == 6
     tools = sorted(await _all(sessionmaker_for, ToolExecution), key=lambda r: r.sequence)
-    assert [t.status for t in tools] == ["OK", "OK", "OK", "SKIPPED"]
+    assert [t.status for t in tools] == ["OK"] * 5 + ["SKIPPED"]
     assert tools[-1].error_code == "max_model_calls"
 
 

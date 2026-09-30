@@ -6,8 +6,9 @@ job runs it against this, because nothing in this suite may reach OpenAI
 calls happened.
 """
 
+import inspect
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from app.integrations.openai import (
     ChatMessage,
@@ -64,6 +65,10 @@ def wants_tools(
     )
 
 
+# A scripted step: a fixed answer, or a function of the conversation so far.
+Step = ChatResult | Callable[[Sequence[ChatMessage]], ChatResult | Awaitable[ChatResult]]
+
+
 class FakeChatClient:
     """A ChatClient that records every call and answers from a script.
 
@@ -75,12 +80,19 @@ class FakeChatClient:
     `tool_specs` is a list PARALLEL to `calls`, holding the tools it was given
     on each call. Kept separate so every VS-005 assertion on `calls` is
     unchanged.
+
+    **A step may be a CALLABLE** (VS-007): it is given the messages so far and
+    returns the `ChatResult`. That is what lets a script behave like a real model
+    instead of a recording - a booking flow has to pass back the `slot_id` the
+    SEARCH RESULT just produced, and that id is an opaque token the test cannot
+    know in advance. A callable step may be async, for a script that needs to
+    await something of its own.
     """
 
-    def __init__(self, *results: ChatResult, hook=None):
+    def __init__(self, *results: Step, hook=None):
         self.calls: list[list[ChatMessage]] = []
         self.tool_specs: list[list[ToolSpec]] = []
-        self._results = list(results) or [ok()]
+        self._results: list[Step] = list(results) or [ok()]
         self._hook = hook
 
     async def complete(
@@ -90,4 +102,23 @@ class FakeChatClient:
         self.tool_specs.append(list(tools))
         if self._hook is not None:
             await self._hook(messages)
-        return self._results.pop(0) if len(self._results) > 1 else self._results[0]
+        step = self._results.pop(0) if len(self._results) > 1 else self._results[0]
+        if isinstance(step, ChatResult):
+            return step
+        answer = step(messages)
+        if inspect.isawaitable(answer):
+            answer = await answer
+        return answer
+
+
+def last_tool_result(messages: Sequence[ChatMessage]) -> dict:
+    """The JSON of the most recent `tool` message, parsed.
+
+    The one helper a callable step needs: it is how a script reads what a tool
+    just returned - a `slot_id` from a search, an `appointment_id` from a list -
+    without the test having to predict an opaque id.
+    """
+    for message in reversed(messages):
+        if message.role == "tool" and message.content:
+            return json.loads(message.content)
+    raise AssertionError("no tool message in the conversation yet")

@@ -222,7 +222,7 @@ def test_the_retry_knobs_have_the_documented_defaults(monkeypatch):
 def test_the_job_timeout_exceeds_the_turn_budget_and_the_meta_send_together(monkeypatch):
     """A real constraint, not a tidy coincidence. Plan section 5.2's arithmetic:
 
-        MAX_MODEL_CALLS (a constant, not a setting)   4   model calls per turn
+        MAX_MODEL_CALLS (a constant, not a setting)   6   model calls per turn
         OPENAI_TIMEOUT_SECONDS                       30   ONE model call
         AGENT_TURN_TIMEOUT_SECONDS                   45   the WHOLE tool loop
         META_SEND_TIMEOUT_SECONDS                    10   the one Meta send
@@ -265,7 +265,8 @@ def test_the_turn_budget_and_the_job_timeout_have_their_documented_defaults(monk
     """Decision D4 with Q4's numbers, pinned so a change is a visible decision.
 
     45 seconds is what a patient waits at worst before the fallback; 90 leaves
-    35 seconds for the job's four transactions once the two network budgets are
+    35 seconds for the job's four short transactions - five with VS-007's T1r -
+    once the two network budgets are
     subtracted. 40/60 was the alternative and leaves only 10.
     """
     for key in ("AGENT_TURN_TIMEOUT_SECONDS", "JOB_TIMEOUT_SECONDS"):

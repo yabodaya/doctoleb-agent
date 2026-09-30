@@ -22,6 +22,8 @@ class ListDoctors:
     name = "list_doctors"
     description = DESCRIPTION
     args_model = NoArguments
+    # Read-only: nothing here can change a booking (VS-007).
+    changes_bookings = False
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> dict[str, Any]:
         doctors = await ctx.booking.list_doctors(ctx.tenant_id)

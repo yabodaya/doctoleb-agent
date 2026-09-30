@@ -188,29 +188,35 @@ async def test_every_request_answers_every_tool_call():
 # --------------------------------------------------------------------------
 
 
-async def test_the_loop_stops_at_four_model_calls():
-    """Decision D4's count limit. The model asks for tools forever.
+async def test_the_loop_stops_at_six_model_calls():
+    """Decision D4's count limit, raised to six by VS-007's V7. The model asks for
+    tools forever.
 
-    Exactly four calls happen; the fourth response's calls are RECORDED and NOT
+    Exactly six calls happen; the sixth response's calls are RECORDED and NOT
     executed - running them would produce results nothing could read. PERMANENT
     (Q3), because a retry would loop the same way and bill again.
+
+    Six rather than four because VS-007's longest normal flow is five calls (list
+    appointments, list doctors, search, hold, answer) and the margin for one
+    self-correction has to sit on top of that (VS-006 amendment B6, restated for
+    six in plan section 5.8).
     """
     chat = FakeChatClient(wants_tools(tool_call("list_doctors", {})))
     booking = spy()
 
     result = await process_turn(turn(), chat, runtime(booking))
 
-    assert MAX_MODEL_CALLS == 4
-    assert len(chat.calls) == 4
-    assert result.model_calls == 4
+    assert MAX_MODEL_CALLS == 6
+    assert len(chat.calls) == 6
+    assert result.model_calls == 6
     assert result.outcome is ChatOutcome.PERMANENT
     assert result.reason == "agent_max_model_calls"
     assert result.reply_text is None
-    # Three rounds of tools ran; the fourth response's call did not.
-    assert booking.methods == ["list_doctors"] * 3
-    assert [r.status.value for r in result.tool_calls] == ["OK", "OK", "OK", "SKIPPED"]
+    # Five rounds of tools ran; the sixth response's call did not.
+    assert booking.methods == ["list_doctors"] * 5
+    assert [r.status.value for r in result.tool_calls] == ["OK"] * 5 + ["SKIPPED"]
     assert result.tool_calls[-1].error_code == "max_model_calls"
-    assert result.tool_calls[-1].model_call == 4
+    assert result.tool_calls[-1].model_call == 6
 
 
 async def test_more_than_twelve_tool_calls_are_skipped():
@@ -255,12 +261,18 @@ async def test_invalid_arguments_are_reported_to_the_model_and_the_loop_continue
     assert result.tool_calls[0].status.value == "INVALID_ARGUMENTS"
 
 
-async def test_an_invalid_call_then_a_corrected_one_fits_in_four_model_calls(monkeypatch):
-    """Amendment B6. The reason MAX_MODEL_CALLS is 4 rather than 3.
+async def test_an_invalid_call_then_a_corrected_one_fits_within_the_limit(monkeypatch):
+    """Amendment B6, restated for six (VS-007's V7).
 
-    The realistic recovery path is: list_doctors, a search with bad arguments,
-    the same search corrected, then the answer. That is exactly four, so the
-    budget accommodates one self-correction without being raised.
+    The realistic recovery path is: list_doctors, a search with bad arguments, the
+    same search corrected, then the answer. That is four calls, and it was the
+    whole reason MAX_MODEL_CALLS was 4 rather than 3 in VS-006.
+
+    VS-007 raised the cap to six because its longest normal flow is five calls (a
+    reschedule: list appointments, list doctors, search, hold, answer), and the
+    margin for one self-correction has to sit on top of the LONGEST flow, not the
+    shortest. Five would leave a reschedule none. This script still takes four, so
+    it now finishes with two calls to spare - which is what the margin looks like.
     """
     chat = FakeChatClient(
         wants_tools(tool_call("list_doctors", {})),
@@ -273,7 +285,8 @@ async def test_an_invalid_call_then_a_corrected_one_fits_in_four_model_calls(mon
     result = await process_turn(turn(), chat, runtime(booking))
 
     assert result.outcome is ChatOutcome.SUCCESS
-    assert result.model_calls == MAX_MODEL_CALLS == 4
+    assert result.model_calls == 4
+    assert MAX_MODEL_CALLS == 6
     assert result.reply_text.startswith("Dr. Karim has")
     assert [r.status.value for r in result.tool_calls] == ["OK", "INVALID_ARGUMENTS", "OK"]
     # The corrected search really ran: the spy saw one search, not two.

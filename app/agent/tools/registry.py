@@ -24,6 +24,7 @@ from app.agent.tools.base import (
     ToolExecutionStatus,
 )
 from app.agent.tools.errors import (
+    BOOKING_MESSAGES,
     DOCTOR_NOT_FOUND_MESSAGE,
     INVALID_ARGUMENTS_MESSAGE,
     INVALID_JSON_MESSAGE,
@@ -32,6 +33,7 @@ from app.agent.tools.errors import (
     UNKNOWN_TOOL_MESSAGE,
     VALIDATION_MESSAGE,
     ToolCrashed,
+    ToolFailure,
     error_body,
     problems_from,
 )
@@ -39,6 +41,42 @@ from app.integrations.booking import BookingError
 from app.integrations.openai import ToolCallRequest, ToolSpec
 
 _NAME = re.compile(TOOL_NAME_PATTERN)
+
+# What a NOT_FOUND means, per changing tool. The same wire code says different
+# fixable things depending on what the tool asked for, and the model can only act
+# on the specific one: "use a slot_id from search" is advice, "not found" is not.
+#
+# `book_appointment` and `reschedule_appointment` map NOT_FOUND to `hold_expired`
+# because the only thing they look up by id is a HOLD, and a hold this service no
+# longer knows about is, from the patient's point of view, a hold that ran out -
+# which is exactly what happens after the in-memory service restarts.
+_CHANGE_NOT_FOUND: dict[str, str] = {
+    "hold_appointment_slot": "slot_not_found",
+    "book_appointment": "hold_expired",
+    "reschedule_appointment": "hold_expired",
+    "cancel_appointment": "appointment_not_found",
+}
+
+# BookingError.code -> (our code, how it is recorded), for a CHANGING tool.
+# `UNCERTAIN` for the two codes that mean "we do not know": recording them as
+# ERROR would assert the change did not happen, which is the one thing we cannot
+# say (V6, hard rule 5).
+_CHANGE_ERRORS: dict[str, tuple[str, ToolExecutionStatus, str]] = {
+    "SLOT_TAKEN": ("slot_taken", ToolExecutionStatus.ERROR, "booking_slot_taken"),
+    "HOLD_EXPIRED": ("hold_expired", ToolExecutionStatus.ERROR, "booking_hold_expired"),
+    "VALIDATION": ("booking_validation", ToolExecutionStatus.ERROR, "booking_validation"),
+    "UNAVAILABLE": ("booking_unavailable", ToolExecutionStatus.ERROR, "booking_unavailable"),
+    "UNKNOWN_OUTCOME": (
+        "outcome_unknown",
+        ToolExecutionStatus.UNCERTAIN,
+        "booking_unknown_outcome",
+    ),
+    "IDEMPOTENCY_CONFLICT": (
+        "outcome_unknown",
+        ToolExecutionStatus.UNCERTAIN,
+        "booking_idempotency_conflict",
+    ),
+}
 
 
 def dump(payload: dict[str, Any]) -> str:
@@ -204,16 +242,34 @@ class ToolRegistry:
         except Exception as crash:  # noqa: BLE001 - re-raised as our own safe type
             raise ToolCrashed(tool.name, type(crash).__name__) from None
 
+        changes = bool(getattr(tool, "changes_bookings", False))
         try:
             payload = await tool.run(args, ctx)
-        except BookingError as error:
-            code, message = _booking_error(tool.name, error)
+        except ToolFailure as refusal:
+            # OUR rule declined it, and nothing was sent to the Booking Service.
+            # REFUSED rather than ERROR, so an operator reading `tool_executions`
+            # can tell "we said no" from "the service failed" (V3, V12, V15).
             return finish(
-                error_body(code, message),
+                error_body(refusal.code, BOOKING_MESSAGES[refusal.code]),
                 tool.name,
                 present,
-                ToolExecutionStatus.ERROR,
-                f"booking_{error.code.lower()}",
+                ToolExecutionStatus.REFUSED,
+                refusal.code,
+            )
+        except BookingError as error:
+            if changes:
+                code, status, error_code = _change_error(tool.name, error)
+            else:
+                code, message = _booking_error(tool.name, error)
+                return finish(
+                    error_body(code, message),
+                    tool.name,
+                    present,
+                    ToolExecutionStatus.ERROR,
+                    f"booking_{error.code.lower()}",
+                )
+            return finish(
+                error_body(code, BOOKING_MESSAGES[code]), tool.name, present, status, error_code
             )
         except ToolCrashed:
             raise
@@ -237,6 +293,24 @@ class ToolRegistry:
         ), ToolCallRecord(sequence, model_call, name, (), ToolExecutionStatus.SKIPPED, reason, 0)
 
 
+def _change_error(tool_name: str, error: BookingError) -> tuple[str, ToolExecutionStatus, str]:
+    """A `BookingError` from a CHANGING tool, as a code and how to record it.
+
+    Two things make this different from the read-side mapping below. NOT_FOUND is
+    per tool, because the model can only act on the specific advice. And
+    UNKNOWN_OUTCOME and IDEMPOTENCY_CONFLICT are recorded `UNCERTAIN`, not
+    `ERROR`: the change may have been applied, and a row saying ERROR would be a
+    claim that it was not (V6, hard rule 5).
+    """
+    if error.code == "NOT_FOUND":
+        code = _CHANGE_NOT_FOUND.get(tool_name, "appointment_not_found")
+        return code, ToolExecutionStatus.ERROR, "booking_not_found"
+    mapped = _CHANGE_ERRORS.get(error.code)
+    if mapped is None:  # pragma: no cover - CODES is closed, and every code is above
+        return "booking_unavailable", ToolExecutionStatus.ERROR, "booking_unavailable"
+    return mapped
+
+
 def _booking_error(tool_name: str, error: BookingError) -> tuple[str, str]:
     """A BookingError as a code and a fixed message.
 
@@ -247,6 +321,12 @@ def _booking_error(tool_name: str, error: BookingError) -> tuple[str, str]:
     was wrong - so it gets a message that tells the model how to fix it. From
     anywhere else it means the clinic itself is unknown, which the model cannot
     fix.
+
+    Anything this table does not name - `UNKNOWN_OUTCOME` included - falls through
+    to `booking_unavailable`. That is a deliberate defence: a read that failed
+    changed nothing, so "we could not check" is the whole truth, and an
+    UNKNOWN_OUTCOME reaching a read tool would be a bug in the client rather than
+    a state a patient should hear about (V6's read/write rule).
     """
     if error.code == "NOT_FOUND":
         if tool_name == "search_available_slots":

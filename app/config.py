@@ -106,8 +106,9 @@ class Settings(BaseSettings):
     job_backoff_base_seconds: float = 5.0
     job_backoff_max_seconds: float = 300.0
     # Must stay above agent_turn_timeout_seconds + meta_send_timeout_seconds
-    # (decision D4; 45 + 10 = 55, so 90 leaves 35s for the job's four
-    # transactions). NOT openai_timeout_seconds: every model call now runs
+    # (decision D4; 45 + 10 = 55, so 90 leaves 35s for the job's four short
+    # transactions - five when VS-007's T1r records a booking change on the
+    # retry path). NOT openai_timeout_seconds: every model call now runs
     # inside the turn budget, so the loop is what this has to cover.
     #
     # A job arq times out is finished as failed and never retried, and none of
@@ -146,6 +147,8 @@ class Settings(BaseSettings):
     # reply, besides the one being answered (plan assumption A8).
     agent_history_messages: int = Field(default=20, ge=0)
     # Sent instead of an AI reply when one cannot be produced (requirement 4).
+    # It must claim NEITHER success NOR failure: VS-007 also sends it after a
+    # booking change whose outcome is unknown (V6, hard rule 5).
     agent_fallback_reply: str = "Sorry, we can't reply right now. The clinic will get back to you."
     # Decision D4: ONE deadline around the WHOLE tool loop - up to
     # MAX_MODEL_CALLS model calls and every tool call between them. Plan

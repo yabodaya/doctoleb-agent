@@ -41,6 +41,7 @@ def turn(
     input_text: str | None = PATIENT_TEXT,
     modality: MessageModality = MessageModality.TEXT,
     history: tuple[HistoryEntry, ...] = (),
+    patient_reference: str | None = None,
 ) -> Turn:
     return Turn(
         tenant_id="clinic-alpha",  # opaque, never a UUID (decision D1)
@@ -49,6 +50,10 @@ def turn(
         modality=modality,
         input_text=input_text,
         history=history,
+        # VS-007: the patient's phone number, and therefore something no repr may
+        # show. Left None by default, so every VS-005 and VS-006 test here builds
+        # exactly the turn it did before.
+        patient_reference=patient_reference,
     )
 
 
@@ -246,4 +251,67 @@ def test_no_repr_shows_message_content():
     # tests/agent/test_tools.py pins that it shows nothing else.
     assert repr(ToolContext("clinic-alpha", FakeBookingClient.demo(clock=lambda: NOW), NOW)) == (
         "ToolContext(tenant_id='clinic-alpha')"
+    )
+
+    # VS-007's additions, extending the same rule to the booking objects. Three
+    # new kinds of thing must stay out of a repr: the patient's PHONE NUMBER (the
+    # patient reference the Booking Service asked for), the Booking Service's own
+    # ids and our idempotency key, and the RECEIPT - which is a doctor's name and
+    # an appointment time (plan section 5.13).
+    from app.agent import (
+        BookingOutcome,
+        BookingState,
+        ChangePhase,
+        ChangeStatus,
+        PatientContext,
+    )
+    from app.db.enums import BookingActionKind, BookingActionStatus
+    from app.integrations.booking import PatientRef
+
+    state = BookingState(
+        action_id=uuid.uuid4(),
+        kind=BookingActionKind.BOOK,
+        status=BookingActionStatus.PENDING,
+        confirmable=True,
+        hold_id=sentinel,
+        appointment_id=sentinel,
+    )
+    outcome = BookingOutcome(
+        kind=BookingActionKind.BOOK,
+        phase=ChangePhase.EXECUTED,
+        status=ChangeStatus.SUCCESS,
+        hold_id=sentinel,
+        appointment_id=sentinel,
+        idempotency_key=sentinel,
+        receipt=sentinel,
+    )
+    patient = PatientContext(
+        bookings=FakeBookingClient.demo(clock=lambda: NOW),
+        patient=PatientRef(sentinel),
+        inbox_event_id=uuid.uuid4(),
+        inbound_message_id=uuid.uuid4(),
+        state=state,
+    )
+
+    assert sentinel not in repr(state)
+    assert sentinel not in repr(outcome)
+    assert sentinel not in repr(patient)
+    assert sentinel not in repr(PatientRef(sentinel))
+    assert sentinel not in repr(turn(input_text=sentinel, patient_reference=sentinel))
+    assert sentinel not in repr(
+        AgentResult(
+            ChatOutcome.SUCCESS,
+            "ok",
+            sentinel,
+            SYSTEM_PROMPT_VERSION,
+            1,
+            1,
+            3,
+            (
+                ToolCallRecord(
+                    0, 1, "book_appointment", ("full_name",), ToolExecutionStatus.OK, None, 4
+                ),
+            ),
+            outcome,
+        )
     )

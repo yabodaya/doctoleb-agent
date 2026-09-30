@@ -113,6 +113,8 @@ class SearchAvailableSlots:
     name = "search_available_slots"
     description = DESCRIPTION
     args_model = SearchAvailableSlotsArgs
+    # Read-only: nothing here can change a booking (VS-007).
+    changes_bookings = False
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> dict[str, Any]:
         assert isinstance(args, SearchAvailableSlotsArgs)  # noqa: S101 - the registry guarantees it

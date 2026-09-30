@@ -20,18 +20,36 @@ that every other line carries, so the job writes the one line per generation.
 from dataclasses import dataclass, field
 
 from app.agent.tools import ToolCallRecord, ToolContext, ToolCrashed, ToolExecutionStatus
+from app.agent.tools.base import (
+    BookingOutcome,
+    ChangeStatus,
+    PatientContext,
+)
 from app.agent.tools.registry import ToolRegistry
 from app.integrations.openai import ChatClient, ChatMessage, ChatOutcome, ChatResult
 
-# Decision D4. A constant, not a setting: the number was fixed by the decision,
-# and a deployment that could raise it could raise the bill without a code
-# change. Three is the normal tool turn (list_doctors, search, answer); the
-# fourth is the margin for one self-correction after an invalid-arguments error.
-MAX_MODEL_CALLS = 4
+# Decision D4, raised to six by VS-007's V7. A constant, not a setting: a
+# deployment that could raise it could raise the bill without a code change.
+#
+# Why six. The longest NORMAL flows are:
+#     book, first message   list_doctors, search, hold, answer            4
+#     move, first message   list_my_appointments, (list_doctors,) search,
+#                           hold, answer                                4-5
+#     cancel, first message list_my_appointments, cancel (prepare), answer  3
+#     any confirmation      the changing tool, answer                     2
+# Six leaves one self-correction on top of the longest of those - the margin
+# VS-006's amendment B6 wanted, now measured against a five-call flow rather
+# than a three-call one. Five would leave a reschedule none.
+#
+# The BILL is what this bounds. How long the patient waits is bounded by
+# AGENT_TURN_TIMEOUT_SECONDS, which ends the turn long before six calls at
+# thirty seconds each could happen.
+MAX_MODEL_CALLS = 6
 
 # A belt-and-braces cap on total tool calls per turn, for the case where the
-# model asks for many PARALLEL calls each round. 4 model calls x 3 tools would
-# be 12; beyond that the turn is not going anywhere useful.
+# model asks for many PARALLEL calls each round. Unchanged at 12: six model calls
+# could now ask for more, but a turn that has run twelve tools is not going
+# anywhere useful, and V12 already allows only one of them to change anything.
 MAX_TOOL_CALLS_PER_TURN = 12
 
 
@@ -70,22 +88,43 @@ class LoopState:
         if result.completion_tokens is not None:
             self.completion_tokens = (self.completion_tokens or 0) + result.completion_tokens
 
-    def close_in_flight(self, error_code: str) -> None:
+    def close_in_flight(self, error_code: str, patient: PatientContext | None = None) -> None:
         """Record the tool that the deadline interrupted.
 
         Without this the call is invisible: it was asked for, it started, it may
         have reached the Booking Service, and `tool_executions` would show a gap
         in `sequence` with nothing explaining it.
+
+        **If that tool was a booking CHANGE** (VS-007), the record is `UNCERTAIN`
+        rather than `ERROR`, and the turn also gets an `UNCERTAIN` outcome carrying
+        the idempotency key. Both halves matter: `ERROR` would assert the change
+        did not happen, and the key is the only thing that lets a human find the
+        request at the Booking Service afterwards (V6, plan risk R11).
+
+        A read cut by the deadline is still `ERROR`, exactly as in VS-006: a read
+        that was cut changed nothing.
         """
         if self.in_flight is None:
             return
         sequence, model_call, tool_name = self.in_flight
+        change = patient.in_flight if patient is not None else None
+        status = ToolExecutionStatus.UNCERTAIN if change else ToolExecutionStatus.ERROR
         self.records.append(
-            ToolCallRecord(
-                sequence, model_call, tool_name, (), ToolExecutionStatus.ERROR, error_code, 0
-            )
+            ToolCallRecord(sequence, model_call, tool_name, (), status, error_code, 0)
         )
         self.in_flight = None
+        if change is not None and patient is not None:
+            patient.record(
+                BookingOutcome(
+                    kind=change.kind,
+                    phase=change.phase,
+                    status=ChangeStatus.UNCERTAIN,
+                    error_code=error_code,
+                    action_id=change.action_id,
+                    idempotency_key=change.idempotency_key,
+                )
+            )
+            patient.end_call()
 
     def record_crash(self, crash: ToolCrashed) -> None:
         self.in_flight = None

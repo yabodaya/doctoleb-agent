@@ -5,9 +5,18 @@ what actually runs, with what arguments, and against which tenant.
 """
 
 from app.agent.tools.base import (
+    MAX_BOOKING_CHANGES_PER_TURN,
+    MIN_SECONDS_FOR_A_BOOKING_CHANGE,
+    OPAQUE_ID,
     TOOL_NAME_PATTERN,
     UNKNOWN_TOOL_NAME,
+    BookingOutcome,
+    BookingState,
+    ChangePhase,
+    ChangeStatus,
+    InFlightChange,
     NoArguments,
+    PatientContext,
     Tool,
     ToolCallRecord,
     ToolContext,
@@ -15,7 +24,7 @@ from app.agent.tools.base import (
 )
 from app.agent.tools.clinic import GetClinicInformation
 from app.agent.tools.doctors import ListDoctors
-from app.agent.tools.errors import ToolCrashed
+from app.agent.tools.errors import BOOKING_MESSAGES, ToolCrashed, ToolFailure
 from app.agent.tools.registry import ToolRegistry
 from app.agent.tools.slots import (
     MAX_SLOTS_RETURNED,
@@ -42,12 +51,22 @@ def default_registry() -> ToolRegistry:
 
 
 __all__ = [
+    "BOOKING_MESSAGES",
+    "MAX_BOOKING_CHANGES_PER_TURN",
     "MAX_SLOTS_RETURNED",
+    "MIN_SECONDS_FOR_A_BOOKING_CHANGE",
+    "OPAQUE_ID",
     "TOOL_NAME_PATTERN",
     "UNKNOWN_TOOL_NAME",
+    "BookingOutcome",
+    "BookingState",
+    "ChangePhase",
+    "ChangeStatus",
     "GetClinicInformation",
+    "InFlightChange",
     "ListDoctors",
     "NoArguments",
+    "PatientContext",
     "SearchAvailableSlots",
     "SearchAvailableSlotsArgs",
     "Tool",
@@ -55,6 +74,7 @@ __all__ = [
     "ToolContext",
     "ToolCrashed",
     "ToolExecutionStatus",
+    "ToolFailure",
     "ToolRegistry",
     "default_registry",
 ]
