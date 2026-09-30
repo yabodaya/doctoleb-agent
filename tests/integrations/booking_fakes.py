@@ -24,6 +24,23 @@ from app.integrations.booking import (
 from app.tenants.ids import TenantId
 
 
+def counter_ids() -> Callable[[str], str]:
+    """A `new_id` for `InMemoryBookingService`: `hold_1`, `apt_1`, `hold_2`, ...
+
+    The real ids are `secrets.token_urlsafe(12)`, which is right in production and
+    useless in a test: an assertion cannot name an id it cannot predict, and a
+    failure message full of random tokens says nothing. One counter per prefix, so
+    holds and appointments number independently.
+    """
+    counters: dict[str, int] = {}
+
+    def make(prefix: str) -> str:
+        counters[prefix] = counters.get(prefix, 0) + 1
+        return f"{prefix}_{counters[prefix]}"
+
+    return make
+
+
 @dataclass(frozen=True)
 class BookingCall:
     """One call, recorded. Tests assert on these instead of on the fake.

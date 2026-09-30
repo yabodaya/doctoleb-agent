@@ -134,6 +134,10 @@ def test_the_agent_imports_neither_the_sdk_nor_the_database():
       connection of any kind. The booking client arrives as a Protocol.
     - app.integrations.booking.fake: demo data is the WORKER's choice, made
       visibly at startup, never something the Agent Core reaches for.
+    - app.integrations.booking.memory (VS-007, V8): the same reasoning, and one
+      more. That module is STATEFUL. If the Agent Core could import it, "where
+      does a hold live" would have a second answer, and the tool loop could
+      reach a booking backend without going through the injected Protocol.
     - app.config: a turn's budget arrives on AgentRuntime. If the agent could
       read Settings, "how long may a turn take" would have two answers.
     - app.worker / arq: the job depends on the agent, never the other way.
@@ -158,6 +162,7 @@ def test_the_agent_imports_neither_the_sdk_nor_the_database():
         "app.config",
         "app.worker",
         "app.integrations.booking.fake",
+        "app.integrations.booking.memory",
         "app.integrations.openai.chat",
     )
     offenders: list[str] = []

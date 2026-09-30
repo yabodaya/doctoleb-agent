@@ -113,6 +113,10 @@ def test_naming_the_tenant_type_does_not_import_the_configuration_layer():
     program = (
         "import sys\n"
         "import app.agent, app.db.repositories, app.integrations.booking\n"
+        # VS-007: the stateful in-memory service is imported here too. It is not
+        # part of app/agent/'s graph, but the worker imports it by its full path,
+        # and if IT reached app.config the same trap would be back one module over.
+        "import app.integrations.booking.memory\n"
         "leaked = [n for n in ('app.config', 'app.tenants.resolver') if n in sys.modules]\n"
         "print(','.join(leaked))\n"
     )
