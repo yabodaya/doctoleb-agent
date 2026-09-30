@@ -13,11 +13,12 @@ import httpx
 from arq.connections import RedisSettings
 from arq.worker import func
 
-from app.agent import utc_now
+from app.agent import Clock, utc_now
+from app.agent.tools import MIN_SECONDS_FOR_A_BOOKING_CHANGE
 from app.channels.whatsapp.client import MetaClient
 from app.config import Settings, get_settings
 from app.db.session import dispose_engine, get_sessionmaker
-from app.integrations.booking.fake import FakeBookingClient
+from app.integrations.booking.memory import InMemoryBookingService
 from app.integrations.openai.chat import OpenAIChatClient
 from app.logging_config import configure_logging
 from app.tenants.resolver import ConfigTenantResolver
@@ -72,10 +73,40 @@ def startup_warnings(settings: Settings) -> list[str]:
     # start, is the whole of the mitigation - with clearly fake names and a
     # fictional address behind it.
     warnings.append(
-        "booking service is the in-memory FAKE (VS-006): availability answers are demo "
-        "data - never put this worker in front of real patients"
+        # The three substrings test_startup_always_warns_that_the_booking_client_is_fake
+        # asserts are kept: "booking service", "FAKE" and "demo". VS-007 adds what is
+        # now also true and was not before - it holds BOOKINGS, they are lost on a
+        # restart, and two workers would each have their own set (risk R8).
+        "booking service is the in-memory FAKE (VS-007): availability, holds and "
+        "bookings are demo data kept in this worker's memory and lost on every "
+        "restart - run ONE worker, and never put this worker in front of real patients"
     )
+    # V15. Below the floor no booking change can ever START, so every confirmation
+    # would be refused with turn_time_low and the patient would be asked to send it
+    # again, forever. A warning rather than a boot failure, like the one above: the
+    # api must not refuse to boot over a worker knob (VS-005 A14).
+    if settings.agent_turn_timeout_seconds <= MIN_SECONDS_FOR_A_BOOKING_CHANGE:
+        warnings.append(
+            f"AGENT_TURN_TIMEOUT_SECONDS={settings.agent_turn_timeout_seconds:g} is not "
+            f"above MIN_SECONDS_FOR_A_BOOKING_CHANGE={MIN_SECONDS_FOR_A_BOOKING_CHANGE:g}: "
+            "no booking change can ever start"
+        )
     return warnings
+
+
+def booking_backends(clock: Clock) -> InMemoryBookingService:
+    """The ONE Booking Service stand-in a worker process uses, for both roles.
+
+    A function so that `startup()` can call it INSIDE arq's running loop. The service
+    holds an `asyncio.Lock`, and a lock binds to the loop it is first contended in
+    (plan check U5): built at import time it would belong to no loop, and the first
+    two concurrent jobs would get `RuntimeError: ... bound to a different event loop`.
+
+    One instance for `booking` AND `patient_bookings`, deliberately: it implements both
+    Protocols, and two instances would mean a hold made through one being invisible to
+    the other - the same slot offered twice.
+    """
+    return InMemoryBookingService.demo(clock=clock)
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -107,7 +138,12 @@ async def startup(ctx: dict[str, Any]) -> None:
     # directly, and the booking client is the in-memory FAKE - see the warning
     # in startup_warnings().
     ctx["clock"] = utc_now
-    ctx["booking"] = FakeBookingClient.demo(clock=utc_now)
+    # VS-007: ONE stateful service for both roles, built HERE so its lock belongs to
+    # arq's loop (plan check U5). Its state - holds, appointments, the replay store -
+    # is lost on every restart, which is what the warning above says out loud.
+    service = booking_backends(utc_now)
+    ctx["booking"] = service
+    ctx["patient_bookings"] = service
     ctx["resolver"] = ConfigTenantResolver.from_settings(settings)
     logger.info("worker started")
 

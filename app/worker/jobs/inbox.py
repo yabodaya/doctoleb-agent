@@ -19,18 +19,24 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent import (
     AgentResult,
     AgentRuntime,
+    BookingOutcome,
+    BookingState,
     Clock,
     HistoryEntry,
     ToolExecutionStatus,
     Turn,
+    compose_reply,
     process_turn,
     utc_now,
 )
+from app.agent.tools import ChangePhase, ChangeStatus
 from app.channels.whatsapp.client import MetaClient, SendOutcome
 from app.channels.whatsapp.payloads import InboundMessage, InboxItemKind, StatusUpdate
 from app.channels.whatsapp.redact import scrub
 from app.config import Settings
 from app.db.enums import (
+    BookingActionKind,
+    BookingActionStatus,
     Channel,
     ConversationState,
     InboxStatus,
@@ -42,6 +48,8 @@ from app.db.models import Message
 from app.db.repositories import (
     AgentRunRepository,
     AgentRunRow,
+    BookingActionRepository,
+    BookingOutcomeRow,
     ContactRepository,
     ConversationRepository,
     DeadLetterJobRepository,
@@ -49,8 +57,12 @@ from app.db.repositories import (
     ToolExecutionRow,
     WebhookInboxRepository,
 )
-from app.db.repositories.errors import DuplicateRecordError, RunNotRecordedError
-from app.integrations.booking import BookingClient
+from app.db.repositories.errors import (
+    BookingStateNotRecordedError,
+    DuplicateRecordError,
+    RunNotRecordedError,
+)
+from app.integrations.booking import BookingClient, PatientBookingClient
 from app.integrations.openai import ChatClient, ChatOutcome
 from app.tenants.ids import TenantId
 from app.tenants.resolver import (
@@ -99,6 +111,11 @@ class EventContext:
     # the tools a spy.
     booking: BookingClient
     clock: Clock
+    # VS-007. The patient side of the Booking Service: the four writes plus the
+    # patient's own list. The worker passes the SAME object as `booking`. None means
+    # a worker with no booking wiring, and a booking tool then crashes the turn
+    # rather than acting for a guessed identity (hard rule 4).
+    patient_bookings: PatientBookingClient | None = None
     job_try: int = 1
 
     @property
@@ -132,6 +149,10 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
     chat: ChatClient = ctx["chat"]
     booking: BookingClient = ctx["booking"]
     clock: Clock = ctx.get("clock", utc_now)
+    # VS-007. `.get`, not `[...]`: a worker built before this slice, or a test that
+    # cares about nothing but the read path, has no patient side - and a booking tool
+    # then crashes the turn rather than acting for a guessed identity (hard rule 4).
+    patient_bookings: PatientBookingClient | None = ctx.get("patient_bookings")
     event_id = uuid.UUID(row_id)
 
     kind: str | None = None
@@ -196,6 +217,7 @@ async def process_inbox_event(ctx: dict[str, Any], row_id: str) -> str:
             chat=chat,
             booking=booking,
             clock=clock,
+            patient_bookings=patient_bookings,
             job_try=job_try,
         )
         outcome = await handler(context)
@@ -286,7 +308,12 @@ async def _release(sessionmaker: async_sessionmaker[AsyncSession], event_id: uui
 
 
 def dead_letter_payload(
-    row_id: uuid.UUID, kind: str | None, phone_number_id: str | None, job_try: int
+    row_id: uuid.UUID,
+    kind: str | None,
+    phone_number_id: str | None,
+    job_try: int,
+    booking: BookingOutcome | None = None,
+    action_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """A REFERENCE to the event, never the event (requirement 6, plan note C7).
 
@@ -300,12 +327,30 @@ def dead_letter_payload(
     It carries our row id, NOT provider_event_id (plan note C2): a wamid decodes
     to include a phone number, and a triage table is read casually.
     """
-    return {
+    payload: dict[str, Any] = {
         "inbox_row_id": str(row_id),
         "kind": kind,
         "phone_number_id": phone_number_id,
         "job_try": job_try,
     }
+    if booking is not None:
+        # VS-007. Ids, codes and a one-way hash - nothing else. The KEY is here
+        # deliberately and is the point of the whole entry: it is how a human asks
+        # the Booking Service what happened to a request whose answer we never got
+        # (V6). It reveals nothing, being SHA-256 over a random row UUID.
+        #
+        # Never here: the patient reference, the patient's name, a doctor's name, an
+        # appointment time, a hold id or a reference code. This table is read
+        # casually during triage (hard rule 8, plan section 5.13).
+        payload["booking"] = {
+            "action_id": str(action_id) if action_id else None,
+            "kind": booking.kind.value,
+            "phase": booking.phase.value,
+            "status": booking.status.value,
+            "error_code": booking.error_code,
+            "idempotency_key": booking.idempotency_key,
+        }
+    return payload
 
 
 async def _dead_letter(
@@ -405,7 +450,10 @@ def _history_entry(row: Message) -> HistoryEntry:
 
 
 async def _record_generation_failure(
-    session: AsyncSession, context: EventContext, reason: str
+    session: AsyncSession,
+    context: EventContext,
+    reason: str,
+    booking: BookingOutcome | None = None,
 ) -> None:
     """Requirement 4: the fallback is sent, and the failure is still recorded.
 
@@ -433,6 +481,7 @@ async def _record_generation_failure(
             InboxItemKind.MESSAGE.value,
             context.phone_number_id,
             context.job_try,
+            booking=booking,
         ),
         error=reason,
         attempts=context.job_try,
@@ -471,6 +520,169 @@ def _tool_rows(result: AgentResult) -> tuple[ToolExecutionRow, ...]:
         )
         for record in result.tool_calls
     )
+
+
+def _final_change(result: AgentResult) -> bool:
+    """Did this turn EXECUTE a change whose outcome is final enough not to redo?
+
+    V11. Once a book, reschedule or cancel came back SUCCESS or UNCERTAIN, that
+    inbound message is never generated again, even if the turn then fails
+    RETRYABLE with tries left. Re-running it would bill a second time and let a
+    fresh model run decide something else - hold another slot after a booking, say -
+    and the patient's answer would then depend on a second model run instead of on
+    the fact we already have.
+
+    A PREPARED change (a hold, a prepared cancellation) is NOT final: a retry
+    re-runs the turn, and the same key or V13 makes the repeated hold the same hold.
+    """
+    outcome = result.booking_outcome
+    return (
+        outcome is not None
+        and outcome.phase is ChangePhase.EXECUTED
+        and outcome.status in (ChangeStatus.SUCCESS, ChangeStatus.UNCERTAIN)
+    )
+
+
+def _booking_reasons(result: AgentResult) -> tuple[str, ...]:
+    """Which booking dead letters this outcome owes a human.
+
+    `booking_uncertain` for an EXECUTED change whose answer is unknown: somebody has
+    to look the request up by its key and tell the patient. An uncertain HOLD is
+    recorded and not dead-lettered - it expires by itself, and a retry repeats it
+    under the same key, so there is nothing for a human to do.
+
+    `booking_idempotency_conflict` is a second, separate entry for the same outcome,
+    because it means something else as well: our key derivation produced the same key
+    for a different body, which is a bug in this repo.
+    """
+    outcome = result.booking_outcome
+    if outcome is None or outcome.status is not ChangeStatus.UNCERTAIN:
+        return ()
+    if outcome.phase is not ChangePhase.EXECUTED:
+        return ()
+    reasons = ["booking_uncertain"]
+    if outcome.error_code == "booking_idempotency_conflict":
+        reasons.append("booking_idempotency_conflict")
+    return tuple(reasons)
+
+
+def _outcome_row(outcome: BookingOutcome) -> BookingOutcomeRow:
+    """`BookingOutcome` -> `BookingOutcomeRow`, the job's own mapping.
+
+    Two small dataclasses instead of one shared import, exactly as for
+    `ToolCallRecord`: `app/db/` must not import `app/agent/` and `app/agent/` must
+    not import `app/db/`, so the job is the one place that knows both.
+
+    The `receipt` is deliberately NOT carried across: it is content, it belongs in
+    `messages.text`, and `booking_actions` holds ids and codes only.
+    """
+    return BookingOutcomeRow(
+        kind=outcome.kind.value,
+        phase=outcome.phase.value,
+        status=outcome.status.value,
+        error_code=outcome.error_code,
+        action_id=outcome.action_id,
+        hold_id=outcome.hold_id,
+        hold_expires_at=outcome.hold_expires_at,
+        appointment_id=outcome.appointment_id,
+        idempotency_key=outcome.idempotency_key,
+    )
+
+
+async def _apply_booking_outcome(
+    session: AsyncSession,
+    context: EventContext,
+    run: "GeneratedRun | None",
+    *,
+    conversation_id: uuid.UUID,
+    inbound_id: uuid.UUID,
+    confirmable: bool,
+) -> uuid.UUID | None:
+    """Record the turn's booking outcome, and log one line about it.
+
+    Inside the repository's SAVEPOINT. A failure becomes
+    `BookingStateNotRecordedError`, which is logged with the exception CLASS name and
+    dead-lettered as `booking_state_not_recorded` - and then the reply still goes out.
+    That is the right order of costs: the Booking Service has already changed
+    something, the patient's receipt is built from the service's own answer rather
+    than from this row, and refusing to reply would help nobody. It NEVER calls
+    `session.rollback()`, which would undo the reservation (plan risk R4).
+
+    `confirmable=False` says the patient will not see this turn's own wording - the
+    reply was dropped, replaced by the guard, or is the fallback - so a change
+    PREPARED in such a turn is stored already SUPERSEDED: nothing described it, so
+    nothing may confirm it later.
+    """
+    if run is None or run.result.booking_outcome is None:
+        return None
+    outcome = run.result.booking_outcome
+    actions = BookingActionRepository(session, context.tenant_id)
+    try:
+        action_id = await actions.apply(
+            _outcome_row(outcome),
+            conversation_id=conversation_id,
+            inbox_event_id=context.event_id,
+            inbound_message_id=inbound_id,
+            confirmable=confirmable,
+        )
+    except BookingStateNotRecordedError as error:
+        logger.error(
+            "booking state not recorded event_id=%s error=%s",
+            context.event_id,
+            error.error_class,
+        )
+        await _add_dead_letter(
+            session, context, "booking_state_not_recorded", booking=outcome, action_id=None
+        )
+        return None
+    # Codes and OUR OWN ids only. Never a service id, a key, a name or a time.
+    logger.info(
+        "booking outcome event_id=%s action_id=%s kind=%s phase=%s status=%s error=%s",
+        context.event_id,
+        action_id,
+        outcome.kind.value,
+        outcome.phase.value,
+        outcome.status.value,
+        outcome.error_code,
+    )
+    for reason in _booking_reasons(run.result):
+        await _add_dead_letter(session, context, reason, booking=outcome, action_id=action_id)
+    return action_id
+
+
+async def _add_dead_letter(
+    session: AsyncSession,
+    context: EventContext,
+    reason: str,
+    *,
+    booking: BookingOutcome | None = None,
+    action_id: uuid.UUID | None = None,
+) -> None:
+    """One dead letter, in the CALLER's transaction.
+
+    In this transaction deliberately, not a fresh one: it has to commit or roll back
+    with the reply it is about, or a crash between the two would leave a human chasing
+    a change that never happened (or none for one that did).
+    """
+    await DeadLetterJobRepository(session).add(
+        job_name=JOB_NAME,
+        payload=dead_letter_payload(
+            context.event_id,
+            _kind_of(context),
+            context.phone_number_id,
+            context.job_try,
+            booking=booking,
+            action_id=action_id,
+        ),
+        error=reason,
+        attempts=context.job_try,
+        source_event_id=str(context.event_id),
+    )
+
+
+def _kind_of(context: EventContext) -> str | None:
+    kind = context.payload.get("kind")
+    return str(kind) if kind is not None else None
 
 
 async def _record_run(
@@ -533,6 +745,8 @@ async def _drop(
     conversation_id: uuid.UUID,
     failure: str | None = None,
     run: "GeneratedRun | None" = None,
+    *,
+    second_read: bool = False,
 ) -> str:
     """Hard rule 7's exit, shared by both reads.
 
@@ -552,8 +766,46 @@ async def _drop(
     reserved = await messages.get_reply_to(inbound_id)
     if reserved is not None and not reserved.provider_message_id:
         await messages.mark_failed(reserved.id)
+
+    # VS-007, plan section 5.12. On the SECOND read the turn may already have
+    # changed something at the Booking Service: the loop has no database access, so
+    # it could not know about the takeover. The change is the patient's own confirmed
+    # request and is NOT undone - it is recorded, and a dead letter tells staff,
+    # because the dead-letter table is the only staff channel until VS-010.
+    if second_read and run is not None and run.result.booking_outcome is not None:
+        outcome = run.result.booking_outcome
+        action_id = await _apply_booking_outcome(
+            session,
+            context,
+            run,
+            conversation_id=conversation_id,
+            inbound_id=inbound_id,
+            # The patient will never see this turn's wording, so a change prepared
+            # here can never be confirmed later.
+            confirmable=False,
+        )
+        if outcome.phase is ChangePhase.EXECUTED and outcome.status is ChangeStatus.SUCCESS:
+            await _add_dead_letter(
+                session,
+                context,
+                "booking_changed_reply_dropped",
+                booking=outcome,
+                action_id=action_id,
+            )
+
+    # Both reads void every PENDING change of the conversation. A staff message sent
+    # in between would otherwise satisfy the gate's "a reply was sent", and the
+    # patient's next "yes" would confirm something the AI prepared and a human never
+    # saw (plan section 5.12).
+    await BookingActionRepository(session, context.tenant_id).supersede_pending(conversation_id)
+
     if failure is not None:
-        await _record_generation_failure(session, context, failure)
+        await _record_generation_failure(
+            session,
+            context,
+            failure,
+            booking=run.result.booking_outcome if run is not None else None,
+        )
     # Recorded with a NULL reply_message_id: the turn ran and was BILLED, and
     # nothing was sent because a human had taken over. That is a fact worth
     # keeping, not an absence.
@@ -574,6 +826,59 @@ async def _drop(
         conversation_id,
     )
     return "dropped_not_ai_active"
+
+
+async def _record_attempt(
+    context: EventContext,
+    run: "GeneratedRun | None",
+    *,
+    conversation_id: uuid.UUID,
+    inbound_id: uuid.UUID,
+) -> None:
+    """T1r: record an attempt that made a booking change and is about to be retried.
+
+    V9, narrowed. Q1 said a RETRYABLE attempt with tries left records nothing, and
+    that still holds for READ-ONLY attempts - `test_a_turn_deadline_retries_and_
+    records_nothing_until_t1b` pins it. But an attempt that made a CHANGE is
+    different in kind: the Booking Service may now hold a hold, or have booked
+    something, that nothing of ours knows about. Losing that with the attempt would
+    leave the next try's gate looking at nothing.
+
+    A short, DEDICATED transaction with no network call inside it, on one path only.
+    The conversation row lock is taken FIRST, for the same reason as in T1b: two quick
+    messages can each carry an outcome, and a lock taken after the insert could
+    deadlock two writers (plan check U8).
+
+    `confirmable=False`: the patient sees no reply from this attempt at all, so a
+    change PREPARED here is stored SUPERSEDED. The retry runs the turn again, the same
+    key or V13 returns the same hold, and the retry's own T1b records it PENDING with
+    the model's new wording (plan section 5.11, row 7).
+    """
+    if run is None or run.result.booking_outcome is None:
+        return
+    async with context.sessionmaker() as session:
+        # FIRST, before anything writes.
+        await ConversationRepository(session, context.tenant_id).current_state(
+            conversation_id, for_update=True
+        )
+        await _record_run(
+            session,
+            context,
+            run,
+            inbound_id=inbound_id,
+            conversation_id=conversation_id,
+            # No reply: this attempt is being retried, and nothing was reserved.
+            reply_message_id=None,
+        )
+        await _apply_booking_outcome(
+            session,
+            context,
+            run,
+            conversation_id=conversation_id,
+            inbound_id=inbound_id,
+            confirmable=False,
+        )
+        await session.commit()
 
 
 async def handle_message(context: EventContext) -> str:
@@ -684,6 +989,38 @@ async def handle_message(context: EventContext) -> str:
             earlier = await messages.history_before(
                 conversation_id, inbound_id, context.settings.agent_history_messages
             )
+            # VS-007. Two reads, in this order.
+            #
+            # First, lapse any hold whose moment has passed, on the INJECTED clock -
+            # never SQL now(). The expiry came from the Booking Service's clock, so
+            # it must be compared with the clock the rest of the turn uses; message
+            # ordering in the gate uses PostgreSQL's, and the two are never compared
+            # with each other (plan risk R5).
+            actions = BookingActionRepository(session, context.tenant_id)
+            await actions.expire_pending(conversation_id, now=context.clock())
+            # Then the gate's verdict, computed in SQL: is the latest prepared change
+            # still PENDING, prepared by a DIFFERENT message, and was a reply of ours
+            # actually SENT in between? The tools get a boolean and cannot
+            # half-apply the rule (V3, hard rule 5).
+            found = await actions.state_for(conversation_id, inbound_id)
+            booking_state = (
+                None
+                if found is None
+                else BookingState(
+                    action_id=found.action_id,
+                    kind=BookingActionKind(found.kind),
+                    status=BookingActionStatus(found.status),
+                    confirmable=found.confirmable,
+                    hold_id=found.hold_id,
+                    appointment_id=found.appointment_id,
+                )
+            )
+            # The patient reference the Booking Service asked for: this contact's
+            # STORED WhatsApp number (V14 as the developer overrode it). Read from
+            # our own row rather than taken off the payload, so the value sent is the
+            # value we store - the same on every retry. It is never sent to the
+            # model, never logged, and in no table, schema, result or dead letter.
+            patient_reference = await contacts.external_id(contact.id, Channel.WHATSAPP)
             turn = Turn(
                 tenant_id=context.tenant_id,
                 contact_id=contact.id,
@@ -691,6 +1028,10 @@ async def handle_message(context: EventContext) -> str:
                 modality=MessageModality(inbound.modality),
                 input_text=inbound.text,
                 history=tuple(_history_entry(row) for row in earlier),
+                inbox_event_id=context.event_id,
+                inbound_message_id=inbound_id,
+                booking_state=booking_state,
+                patient_reference=patient_reference,
             )
         await session.commit()
     # The session is CLOSED. No transaction is open from here until T1b: the
@@ -712,6 +1053,7 @@ async def handle_message(context: EventContext) -> str:
                 booking=context.booking,
                 clock=context.clock,
                 turn_timeout_seconds=context.settings.agent_turn_timeout_seconds,
+                patient_bookings=context.patient_bookings,
             ),
         )
         run = GeneratedRun(
@@ -746,7 +1088,22 @@ async def handle_message(context: EventContext) -> str:
         elif (
             generated.outcome is ChatOutcome.RETRYABLE
             and context.job_try < context.settings.job_max_tries
+            # V11. A turn that already EXECUTED a change is never generated again,
+            # however it then failed. A re-run would bill a second time and let a
+            # fresh model run decide something else - hold another slot after a
+            # booking - so the patient's answer would depend on a second model run
+            # instead of on the fact we already have. The fallback plus the receipt
+            # tells them what happened.
+            and not _final_change(generated)
         ):
+            # V9. The attempt made a booking CHANGE, so it is recorded before the
+            # retry rather than lost with it: its model calls were billed, its tools
+            # ran, and the Booking Service may now hold a hold nothing of ours knows
+            # about. Read-only attempts keep Q1 and record nothing.
+            if generated.booking_outcome is not None:
+                await _record_attempt(
+                    context, run, conversation_id=conversation_id, inbound_id=inbound_id
+                )
             # Nothing is reserved, so the next try starts clean and asks again.
             raise RetryableJobError(generated.reason)
         else:
@@ -764,9 +1121,39 @@ async def handle_message(context: EventContext) -> str:
         # transaction, immediately before the reservation and the send. The model
         # call is the longest thing the job does, so the check that protects the
         # send has to come after it.
-        state = await conversations.current_state(conversation_id)
+        # FOR UPDATE when the turn carries a booking outcome, and FIRST in the
+        # transaction. Two quick messages can each produce a turn with an outcome;
+        # without the lock both would supersede the same PENDING row and both insert
+        # a new one, the second violating the partial unique index. The reply's own
+        # insert takes a KEY SHARE lock on this row through its foreign key, so a
+        # lock taken after it could deadlock two T1b's (plan check U8).
+        carries_outcome = run is not None and run.result.booking_outcome is not None
+        state = await conversations.current_state(conversation_id, for_update=carries_outcome)
         if state is None or state not in _AI_STATES:
-            return await _drop(session, context, inbound_id, conversation_id, failure, run=run)
+            return await _drop(
+                session,
+                context,
+                inbound_id,
+                conversation_id,
+                failure,
+                run=run,
+                second_read=True,
+            )
+
+        # G1's rule for WHICH receipt is shown. An EXECUTED success's receipt always
+        # goes, whatever the reply is - the change happened and the patient is owed
+        # the proof. A PREPARED change's receipt goes only with the model's OWN reply,
+        # because the ⏳ refers to a question only the model's wording asked.
+        receipt: str | None = None
+        outcome = run.result.booking_outcome if run is not None else None
+        if outcome is not None and outcome.receipt:
+            executed_success = (
+                outcome.phase is ChangePhase.EXECUTED and outcome.status is ChangeStatus.SUCCESS
+            )
+            if executed_success or failure is None:
+                receipt = outcome.receipt
+        if reply_text is not None:
+            reply_text = compose_reply(reply_text, receipt)
 
         if reply_text is not None:
             # WITH the text. Once a text is reserved, that text IS the reply:
@@ -786,8 +1173,11 @@ async def handle_message(context: EventContext) -> str:
 
         reply_id, text_to_send = reply.id, reply.text
         if failure is not None:
-            # In THIS transaction, with the reservation (plan conflict C7).
-            await _record_generation_failure(session, context, failure)
+            # In THIS transaction, with the reservation (plan conflict C7). It carries
+            # the booking block too: somebody triaging a fallback - or an
+            # `agent_unconfirmed_claim` - needs to know whether a change happened
+            # before they reply to the patient by hand.
+            await _record_generation_failure(session, context, failure, booking=outcome)
         # AFTER the reservation, inside its own SAVEPOINT: if this fails, only
         # these rows roll back and the reply still goes out.
         await _record_run(
@@ -797,6 +1187,18 @@ async def handle_message(context: EventContext) -> str:
             inbound_id=inbound_id,
             conversation_id=conversation_id,
             reply_message_id=reply_id,
+        )
+        # Then the booking outcome, also in a SAVEPOINT. `confirmable` is "will the
+        # patient see this turn's OWN wording?": the model's reply, yes; the fallback
+        # or a guard replacement, no - and a change prepared in such a turn is stored
+        # SUPERSEDED, because nothing described it to the patient (plan section 5.4).
+        await _apply_booking_outcome(
+            session,
+            context,
+            run,
+            conversation_id=conversation_id,
+            inbound_id=inbound_id,
+            confirmable=failure is None,
         )
         # COMMIT before touching Meta. A reply row written in the same
         # transaction as the wamid would leave no trace of an attempted send, and

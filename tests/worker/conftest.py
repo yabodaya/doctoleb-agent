@@ -222,6 +222,10 @@ def job_context(sessionmaker, meta: MetaClient, settings: Settings | None = None
         # no tools) while a test that cares can pass a RecordingBooking.
         "clock": FROZEN_CLOCK,
         "booking": FakeBookingClient.demo(clock=FROZEN_CLOCK),
+        # VS-007: None by default, so every VS-004 to VS-006 test runs with no
+        # booking wiring at all and is unaffected. A booking test passes the SAME
+        # InMemoryBookingService for both roles, as the worker does.
+        "patient_bookings": None,
         "resolver": ConfigTenantResolver.from_settings(settings),
         "job_try": 1,
     }
@@ -308,3 +312,23 @@ def pipeline(sessionmaker_for, client_for):
             return outcomes
 
     return Pipeline()
+
+
+def booking_service(clock=FROZEN_CLOCK, **options):
+    """One `InMemoryBookingService` for a test, for BOTH booking roles.
+
+    Per test, never shared: the service holds an `asyncio.Lock`, and a lock binds to
+    the loop it is first contended in (plan check U5). `counter_ids()` makes the ids
+    readable, so an assertion can name `hold_1` and `apt_1`.
+    """
+    from app.integrations.booking.fake import FakeBookingClient as _Fake
+    from app.integrations.booking.memory import InMemoryBookingService
+    from tests.integrations.booking_fakes import counter_ids
+
+    return InMemoryBookingService(
+        _Fake.demo(clock=clock),
+        clock,
+        id_secret=b"a fixed secret for the worker booking tests",
+        new_id=counter_ids(),
+        **options,
+    )
