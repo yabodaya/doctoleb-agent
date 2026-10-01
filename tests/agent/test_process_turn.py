@@ -169,6 +169,13 @@ def test_the_agent_imports_neither_the_sdk_nor_the_database():
         "app.integrations.booking.fake",
         "app.integrations.booking.memory",
         "app.integrations.openai.chat",
+        # VS-008: the audio model, for the same reason as the chat one. The
+        # model must not be able to decide whether to transcribe, or to see a
+        # media id - a transcript is the INPUT to a turn, not something the turn
+        # can ask for. It reaches app/agent/ as a plain string on
+        # Turn.input_text. (The media client needs no entry: "app.channels"
+        # above already forbids the whole package.)
+        "app.integrations.openai.transcribe",
     )
     offenders: list[str] = []
     for path in pathlib.Path("app/agent").rglob("*.py"):

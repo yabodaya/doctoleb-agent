@@ -9,15 +9,21 @@ table", before changing any of the decisions below.
 """
 
 import asyncio
-import re
 from collections.abc import Sequence
 from typing import Any
 
 import httpx2
-import openai
 from openai import AsyncOpenAI
 
 from app.config import Settings
+
+# Re-exported, not re-implemented. The classifier moved to errors.py in VS-008
+# when the transcription client became its second caller, and it is re-exported
+# here so every existing import - `from app.integrations.openai.chat import
+# classify_openai_error` - and every existing test keeps working unchanged.
+# tests/integrations/test_transcribe.py asserts the two names are the SAME
+# OBJECT, so a future tidy-up cannot fork them into two drifting tables.
+from app.integrations.openai.errors import classify_openai_error
 from app.integrations.openai.interface import (
     ChatMessage,
     ChatOutcome,
@@ -26,49 +32,11 @@ from app.integrations.openai.interface import (
     ToolSpec,
 )
 
-# OpenAI error codes look like this (insufficient_quota, model_not_found).
-# Anything else is left out of the reason rather than trusted into a log line or
-# a dead letter (hard rule 8).
-_CODE_SHAPE = re.compile(r"[a-z0-9_]{1,48}")
-
-# The one 429 that retrying cannot fix: the account has no credit (requirement 3).
-# Checked against both `code` and `type`, which OpenAI's documented body sets to
-# the same value; see "What was verified" in the plan.
-_NO_CREDIT = "insufficient_quota"
-
-
-def classify_openai_error(error: Exception) -> tuple[ChatOutcome, str] | None:
-    """The single place an OpenAI failure becomes a retry decision.
-
-    Retryable: timeouts (ours and the SDK's, and a 408), connection errors, 5xx,
-    and a 429 rate limit. Permanent: every other 4xx, and a 429 for no credit.
-
-    Never reads error.message, and never str(error): both carry OpenAI's text,
-    and for a 401 the masked key fragment OpenAI echoes back. Returns None for
-    anything that is not an OpenAI API error, so a bug escapes instead of being
-    retried five times and answered with the fallback as if OpenAI were down.
-    """
-    # Before APIConnectionError: APITimeoutError is a subclass of it. The
-    # built-in TimeoutError is our own asyncio.timeout deadline firing.
-    if isinstance(error, TimeoutError | openai.APITimeoutError):
-        return ChatOutcome.RETRYABLE, "openai_timeout"
-    if isinstance(error, openai.APIConnectionError):
-        return ChatOutcome.RETRYABLE, "openai_connection"
-    if isinstance(error, openai.APIStatusError):
-        status = error.status_code
-        if status == 429:
-            if _NO_CREDIT in (error.code, error.type):
-                return ChatOutcome.PERMANENT, "openai_insufficient_quota"
-            return ChatOutcome.RETRYABLE, "openai_http_429"
-        if status >= 500 or status == 408:
-            return ChatOutcome.RETRYABLE, f"openai_http_{status}"
-        code = error.code if error.code and _CODE_SHAPE.fullmatch(error.code) else None
-        return ChatOutcome.PERMANENT, f"openai_http_{status}" + (f"_{code}" if code else "")
-    if isinstance(error, openai.APIError):
-        # APIResponseValidationError and anything else the SDK adds later. A
-        # response we could not make sense of is most likely transient.
-        return ChatOutcome.RETRYABLE, "openai_bad_response"
-    return None
+__all__ = [
+    "OpenAIChatClient",
+    "classify_openai_error",
+    "read_completion",
+]
 
 
 def _token_counts(completion: object) -> tuple[int | None, int | None]:

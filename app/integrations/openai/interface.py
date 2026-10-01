@@ -127,6 +127,64 @@ class ChatResult:
         return self.outcome is ChatOutcome.SUCCESS
 
 
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """The outcome of ONE transcription attempt, classified (VS-008).
+
+    `outcome` reuses `ChatOutcome` rather than introducing a fourth parallel
+    three-value enum: the job's three choices are the same three - use it, try
+    again later, stop trying.
+
+    `reason` is a short code built from a status and an allow-listed error code,
+    as `ChatResult.reason` is, because it is written to logs and to
+    `dead_letter_jobs.error`.
+
+    `text` is the patient's own words and is excluded from the repr for exactly
+    the reason `ChatMessage.content` is: pytest prints reprs on a failed
+    assertion, which is how a patient's words reach a CI log (hard rule 8).
+
+    `seconds` is whatever the API reported, when it reports anything at all -
+    the newer audio models return JSON with `usage` and nothing else, and some
+    of them report tokens rather than seconds (plan check U8). Nothing decides
+    with it; it is recorded so the real cost per voice note can be worked out
+    from a table instead of from a bill.
+    """
+
+    outcome: ChatOutcome
+    reason: str
+    text: str | None = field(default=None, repr=False)
+    seconds: float | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome is ChatOutcome.SUCCESS
+
+
+@runtime_checkable
+class TranscribeClient(Protocol):
+    """What the worker is allowed to know about an audio model (VS-008).
+
+    Deliberately NOT something `app/agent/` ever sees. The model must not be
+    able to decide whether to transcribe, or to see a media id: a transcript is
+    the INPUT to a turn, not something the turn can ask for (hard rule 3). So
+    this Protocol is injected into the JOB, and the transcript reaches the Agent
+    Core as a plain string on `Turn.input_text`.
+    """
+
+    async def transcribe(
+        self, audio: bytes, *, filename: str, content_type: str
+    ) -> TranscriptionResult:
+        """One attempt. Never a retry (hard rule 11).
+
+        Never raises for a provider failure: it returns a classified result. A
+        bug in OUR code still raises.
+
+        `audio` is bytes in memory, never a path: the audio is not stored
+        anywhere (W1), so there is no file to name.
+        """
+        ...
+
+
 @runtime_checkable
 class ChatClient(Protocol):
     """What the worker and the agent are allowed to know about a chat model."""

@@ -495,11 +495,32 @@ async def test_a_real_transport_is_blocked_in_the_test_suite():
 def test_only_the_openai_integration_imports_the_sdk():
     """Hard rule 3 made structural, and "classify in one place" made enforceable.
 
-    The LLM gets no raw HTTP access: the SDK lives behind ChatClient in exactly
-    one module. An `import openai` anywhere else is a second place a request
-    could be made, a second place an exception could be swallowed, and a second
-    place a response body could reach a log.
+    The LLM gets no raw HTTP access: the SDK lives behind a Protocol, inside
+    this one package. An `import openai` anywhere else is a second place a
+    request could be made, a second place an exception could be swallowed, and
+    a second place a response body could reach a log.
+
+    VS-008 made the list three files, and the guarantee is unchanged - the
+    constraint was always "inside app/integrations/openai/, and nowhere else",
+    and in VS-005 to VS-007 that package had exactly one SDK module:
+
+      * chat.py       - the chat endpoint, as before;
+      * transcribe.py - the audio endpoint (the same discipline: one attempt,
+                        one deadline, one classifier);
+      * errors.py     - the shared classifier, which needs the SDK's exception
+                        TYPES to classify them. It moved out of chat.py when
+                        transcribe.py became its second caller, and chat.py
+                        re-exports it (plan conflict C19).
+
+    `interface.py` and `transcripts.py` are deliberately NOT on this list, and
+    must never be: app/agent/ imports the package, so anything it re-exports
+    would load the SDK into the Agent Core.
     """
+    allowed = [
+        "app/integrations/openai/chat.py",
+        "app/integrations/openai/errors.py",
+        "app/integrations/openai/transcribe.py",
+    ]
     offenders = []
     for path in pathlib.Path("app").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -513,7 +534,10 @@ def test_only_the_openai_integration_imports_the_sdk():
             if any(name == "openai" or name.startswith("openai.") for name in names):
                 offenders.append(path.as_posix())
 
-    assert sorted(set(offenders)) == ["app/integrations/openai/chat.py"]
+    assert sorted(set(offenders)) == allowed
+    # Said twice, on purpose: the list above is a fact that will move again
+    # (VS-009 adds a TTS module), but THIS is the rule that must not.
+    assert all(path.startswith("app/integrations/openai/") for path in sorted(set(offenders)))
 
 
 def test_no_repr_shows_message_content():

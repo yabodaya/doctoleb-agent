@@ -16,12 +16,20 @@ from app.integrations.openai import (
     ChatResult,
     ToolCallRequest,
     ToolSpec,
+    TranscriptionResult,
 )
 
 # The text the fake model "writes". Asserted ABSENT from every log line, job
 # result and dead letter, and PRESENT in the reply row and the Meta request -
 # which is the whole of "the generated text is what gets sent".
 AI_REPLY = "synthetic ai reply"
+
+# What the fake audio model "hears" (VS-008). An obvious synthetic sentence, as
+# every string in these fixtures is: hard rule 8 forbids a real recording OR a
+# real person's words in a fixture, and a plausible-looking transcript in a test
+# file is the second of those. Asserted PRESENT in messages.text and ABSENT
+# everywhere else.
+TRANSCRIPT = "synthetic voice note transcript"
 
 
 def ok(text: str = AI_REPLY, prompt_tokens: int = 11, completion_tokens: int = 7) -> ChatResult:
@@ -106,6 +114,73 @@ class FakeChatClient:
         if isinstance(step, ChatResult):
             return step
         answer = step(messages)
+        if inspect.isawaitable(answer):
+            answer = await answer
+        return answer
+
+
+# --------------------------------------------------------------------------
+# VS-008: the audio model
+# --------------------------------------------------------------------------
+
+
+def heard(text: str = TRANSCRIPT, seconds: float | None = 3.5) -> TranscriptionResult:
+    return TranscriptionResult(ChatOutcome.SUCCESS, "ok", text, seconds)
+
+
+def unclear(text: str = "") -> TranscriptionResult:
+    """A SUCCESS whose text is nothing a model could act on.
+
+    Note the outcome: an empty transcript is not a FAILURE of the audio model.
+    The call worked and was billed; there was simply nothing in the audio. The
+    job's `unusable_reason` is what turns this into the UNCLEAR reply (W5).
+    """
+    return TranscriptionResult(ChatOutcome.SUCCESS, "ok", text, 1.0)
+
+
+def transcribe_retryable(reason: str = "openai_http_503") -> TranscriptionResult:
+    return TranscriptionResult(ChatOutcome.RETRYABLE, reason)
+
+
+def transcribe_permanent(reason: str = "openai_insufficient_quota") -> TranscriptionResult:
+    return TranscriptionResult(ChatOutcome.PERMANENT, reason)
+
+
+# A scripted transcription step: a fixed answer, or a function of the audio.
+TranscribeStep = (
+    TranscriptionResult | Callable[[bytes], TranscriptionResult | Awaitable[TranscriptionResult]]
+)
+
+
+class FakeTranscribeClient:
+    """A TranscribeClient that never leaves the process.
+
+    `FakeChatClient`'s shape: scripted results, the last one repeating, and
+    callable steps allowed so a script can answer differently for different
+    audio.
+
+    `calls` records **the byte count and the content type, and nothing else**.
+    Deliberately not the audio and not the transcript it was asked to return: a
+    fake that stored either would put patient content in a fixture, which is
+    the thing hard rule 8 forbids. A test that wants to know what was sent
+    asserts on the count.
+    """
+
+    def __init__(self, *results: TranscribeStep, hook=None):
+        self.calls: list[tuple[int, str]] = []
+        self._results: list[TranscribeStep] = list(results) or [heard()]
+        self._hook = hook
+
+    async def transcribe(
+        self, audio: bytes, *, filename: str, content_type: str
+    ) -> TranscriptionResult:
+        self.calls.append((len(audio), content_type))
+        if self._hook is not None:
+            await self._hook(audio)
+        step = self._results.pop(0) if len(self._results) > 1 else self._results[0]
+        if isinstance(step, TranscriptionResult):
+            return step
+        answer = step(audio)
         if inspect.isawaitable(answer):
             answer = await answer
         return answer
