@@ -12,6 +12,7 @@ from app.db.models import (
     DeadLetterJob,
     Message,
     ToolExecution,
+    VoiceNote,
     WebhookInbox,
 )
 
@@ -25,6 +26,7 @@ ALL_MODELS = [
     AgentRun,
     ToolExecution,
     BookingAction,
+    VoiceNote,
 ]
 
 
@@ -58,6 +60,10 @@ def test_the_slice_creates_exactly_these_tables():
         # prepared change. Still no appointment data: the appointment itself
         # belongs to the Booking Service, and only its id is referenced here.
         "booking_actions",
+        # VS-008. Ids, codes and counts - one voice note's bookkeeping. NOT the
+        # transcript, which is the patient's message and lives in
+        # messages.text, and NOT the audio, which is not stored anywhere at all.
+        "voice_notes",
     }
 
 
@@ -104,6 +110,7 @@ def test_tenant_id_is_not_null_everywhere_a_tenant_is_knowable():
         AgentRun,
         ToolExecution,
         BookingAction,
+        VoiceNote,
     ):
         assert model.__table__.c.tenant_id.nullable is False, model.__tablename__
     assert WebhookInbox.__table__.c.tenant_id.nullable is True
@@ -126,6 +133,7 @@ def test_enum_backed_columns_carry_a_named_check_constraint():
         "messages": "ck_messages_direction_valid",
         "webhook_inbox": "ck_webhook_inbox_status_valid",
         "booking_actions": "ck_booking_actions_kind_valid",
+        "voice_notes": "ck_voice_notes_status_valid",
     }
     for table_name, constraint_name in expected.items():
         table = Base.metadata.tables[table_name]

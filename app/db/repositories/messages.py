@@ -70,6 +70,41 @@ class MessageRepository(TenantScopedRepository):
             )
         return message
 
+    async def set_transcript(self, message_id: uuid.UUID, text: str) -> bool:
+        """Write a voice note's transcript onto the message it belongs to (VS-008).
+
+        The transcript IS the patient's message, so it goes in the same column a
+        typed one uses, under the same retention and the same access. There is
+        no second place it lives (hard rule 8).
+
+        `AND text IS NULL` in the WHERE clause rather than a read-then-write, for
+        two reasons. Two workers cannot then disagree about what the patient
+        said: the first write wins and the second is a no-op, instead of the
+        last one overwriting a transcript somebody has already built a turn
+        from. And a retry that somehow reaches this with the row already written
+        finds it written and moves on.
+
+        Returns whether it updated. The caller does not care today - "already
+        written" and "just written" are the same situation - but the return
+        value is what lets a test tell them apart.
+
+        Deliberately NOT inside a savepoint, unlike the `voice_notes` write that
+        accompanies it. If this fails the transaction must fail and the job must
+        retry: a turn built from a transcript nobody stored is exactly what
+        writing it immediately exists to prevent, because the retry would pay
+        for a second transcription and could hear something different.
+        """
+        result = await self._session.execute(
+            sa.update(Message)
+            .where(
+                Message.id == message_id,
+                Message.tenant_id == self.tenant_id,
+                Message.text.is_(None),
+            )
+            .values(text=text)
+        )
+        return result.rowcount == 1
+
     async def get_by_provider_id(self, provider_message_id: str) -> Message | None:
         return await self._session.scalar(
             sa.select(Message).where(

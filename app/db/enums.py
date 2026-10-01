@@ -136,6 +136,34 @@ class ToolExecutionStatus(StrEnum):
     REFUSED = "REFUSED"
 
 
+class VoiceNoteStatus(StrEnum):
+    """How far one voice note got (VS-008).
+
+    PENDING   an attempt started and did not finish: the job died, or the media
+              or transcription step failed RETRYABLY. The ONE state a retry
+              re-attempts.
+    DONE      transcribed; `messages.text` holds the transcript. A retry reads
+              this and skips the whole voice step, so nobody pays twice - which
+              matters more here than anywhere else in the repo, because
+              transcription is the one step that costs money per attempt and
+              cannot be made idempotent by a key.
+    UNCLEAR   transcribed to nothing usable (empty, too short, a known silence
+              output, or flagged no-speech). The patient was asked to repeat or
+              type, and the model was never called.
+    FAILED    permanently: no media id, an expired id, a rejected URL, an
+              oversized or unsupported file, no model configured, a 4xx from
+              the audio endpoint. The patient was told to type instead.
+
+    UNCLEAR, DONE and FAILED are all terminal for the message: the patient has
+    been answered, so no retry reaches them.
+    """
+
+    PENDING = "PENDING"
+    DONE = "DONE"
+    UNCLEAR = "UNCLEAR"
+    FAILED = "FAILED"
+
+
 class BookingActionKind(StrEnum):
     """Which kind of change a `booking_actions` row is about (VS-007, V2).
 

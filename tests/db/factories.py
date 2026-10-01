@@ -20,6 +20,7 @@ from app.db.enums import (
     MessageModality,
     MessageStatus,
     ToolExecutionStatus,
+    VoiceNoteStatus,
 )
 from app.db.models import (
     AgentRun,
@@ -29,6 +30,7 @@ from app.db.models import (
     Conversation,
     Message,
     ToolExecution,
+    VoiceNote,
     WebhookInbox,
 )
 from app.tenants.ids import TenantId
@@ -167,6 +169,28 @@ def make_tool_execution(run: AgentRun, sequence: int = 0, **overrides: Any) -> T
     }
     values.update(overrides)
     return ToolExecution(**values)
+
+
+def make_voice_note(message: Message, **overrides: Any) -> VoiceNote:
+    """One voice note's bookkeeping, PENDING by default.
+
+    Ids, codes and counts - there is nothing else this table may hold, which is
+    why the factory takes no text at all. Not even a transcript argument exists:
+    the transcript belongs on `messages.text`, so a test that wants one sets it
+    there (hard rule 8).
+    """
+    values: dict[str, Any] = {
+        "tenant_id": message.tenant_id,
+        "message_id": message.id,
+        "inbox_event_id": uuid.uuid4(),
+        "media_id": "media-id-0000001",
+        "mime_type": "audio/ogg",
+        "voice": True,
+        "status": VoiceNoteStatus.PENDING.value,
+        "attempts": 1,
+    }
+    values.update(overrides)
+    return VoiceNote(**values)
 
 
 def make_booking_action(

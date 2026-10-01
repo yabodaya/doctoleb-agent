@@ -23,9 +23,11 @@ from app.db.repositories.errors import (
     DuplicateRecordError,
     RepositoryError,
     RunNotRecordedError,
+    VoiceNoteNotRecordedError,
     as_duplicate,
 )
 from app.db.repositories.messages import MessageRepository
+from app.db.repositories.voice_notes import VoiceNoteRepository, VoiceNoteRow
 from app.db.repositories.webhook_inbox import ClaimResult, WebhookInboxRepository
 
 __all__ = [
@@ -44,6 +46,9 @@ __all__ = [
     "RepositoryError",
     "RunNotRecordedError",
     "ToolExecutionRow",
+    "VoiceNoteNotRecordedError",
+    "VoiceNoteRepository",
+    "VoiceNoteRow",
     "WebhookInboxRepository",
     "as_duplicate",
 ]

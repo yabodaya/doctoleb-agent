@@ -26,6 +26,7 @@ VS004_REVISION = "22a816a5a08d"
 TENANT_TEXT_REVISION = "4f3c8d21a90e"
 AGENT_RUNS_REVISION = "50a570a315fb"
 BOOKING_ACTIONS_REVISION = "b919820bf52e"
+VOICE_NOTES_REVISION = "7c4e1a9db203"
 
 EXPECTED_TABLES = {
     "webhook_inbox",
@@ -37,6 +38,7 @@ EXPECTED_TABLES = {
     "agent_runs",
     "tool_executions",
     "booking_actions",
+    "voice_notes",
     "alembic_version",
 }
 
@@ -180,6 +182,10 @@ def test_one_step_downgrade_and_upgrade_is_repeatable(lifecycle_url: str):
     dropped by the end anyway. Stepping back exactly one revision and forward
     again is what proves THIS revision reverses itself - the CHECK swap
     included, which nothing else in this suite can see.
+
+    It has always stepped back from `head`, so as of VS-008 the revision it
+    covers is `7c4e1a9db203` (voice_notes) rather than `b919820bf52e`. Nothing
+    about the test changed; the newest revision did.
     """
     config = alembic_config(lifecycle_url)
     command.upgrade(config, "head")
@@ -325,6 +331,57 @@ def _revision(url: str) -> str | None:
             await engine.dispose()
 
     return asyncio.run(_read())
+
+
+def test_the_voice_notes_revision_creates_and_drops_the_table(lifecycle_url: str):
+    """VS-008's migration, walked by hand.
+
+      upgrade to 7c4e1a9db203   -> voice_notes exists and accepts a row
+      downgrade to b919820bf52e -> the table is gone, and `messages` still has
+                                   its rows AND its text
+
+    The second half is the point, and it is why this downgrade needs no guard
+    (unlike VS-007's, which deliberately fails while a widened CHECK value is in
+    use). Dropping `voice_notes` loses operational bookkeeping - who transcribed
+    what, how big it was, which model - and loses NO patient content, because
+    the transcript is in `messages.text` and this migration never touches it.
+    """
+    config = alembic_config(lifecycle_url)
+    command.upgrade(config, VOICE_NOTES_REVISION)
+    assert "voice_notes" in _table_names(lifecycle_url)
+
+    contact, conversation, message, note = (uuid.uuid4() for _ in range(4))
+    tenant = "clinic-alpha"
+    transcript = "a synthetic transcript that must survive the downgrade"
+    _execute(
+        lifecycle_url,
+        f"insert into contacts (id, tenant_id) values ('{contact}', '{tenant}')",
+        "insert into conversations (id, tenant_id, contact_id, channel, state) "
+        f"values ('{conversation}', '{tenant}', '{contact}', 'whatsapp', 'AI_ACTIVE')",
+        "insert into messages (id, tenant_id, conversation_id, direction, modality, "
+        "status, text) "
+        f"values ('{message}', '{tenant}', '{conversation}', 'INBOUND', 'VOICE_NOTE', "
+        f"'RECEIVED', '{transcript}')",
+        "insert into voice_notes (id, tenant_id, message_id, inbox_event_id, media_id, "
+        "mime_type, byte_size, status, model, attempts) "
+        f"values ('{note}', '{tenant}', '{message}', '{uuid.uuid4()}', 'media-id-1', "
+        "'audio/ogg', 64, 'DONE', 'a-model', 1)",
+    )
+
+    try:
+        command.downgrade(config, BOOKING_ACTIONS_REVISION)
+
+        assert _revision(lifecycle_url) == BOOKING_ACTIONS_REVISION
+        assert "voice_notes" not in _table_names(lifecycle_url)
+        # The transcript is untouched: it was never in the dropped table.
+        rows = _rows(lifecycle_url, f"select text from messages where id = '{message}'")
+        assert rows == [(transcript,)]
+    finally:
+        # The same cleanup VS-007's test needs, and for the same reason: these
+        # rows carry an OPAQUE tenant id (decision D1), and a later fixture
+        # downgrades to base through `USING tenant_id::uuid`.
+        command.upgrade(config, VOICE_NOTES_REVISION)
+        _execute(lifecycle_url, f"delete from contacts where id = '{contact}'")
 
 
 def test_the_booking_revision_widens_the_tool_status_check_and_narrows_it_back(lifecycle_url: str):

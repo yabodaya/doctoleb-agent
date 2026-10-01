@@ -91,6 +91,26 @@ class RunNotRecordedError(RepositoryError):
         super().__init__(f"agent run not recorded: {error_class}")
 
 
+class VoiceNoteNotRecordedError(RepositoryError):
+    """Recording a voice note's bookkeeping failed (VS-008).
+
+    The same shape and the same reasoning as `RunNotRecordedError`: the exception
+    CLASS name and nothing else, raised `from None` so no chained traceback
+    survives to print the statement.
+
+    The caller logs it and carries on, because bookkeeping that fails must never
+    cost a patient their reply. Note what is NOT in this savepoint: the
+    transcript write. That one is allowed to fail the whole transaction, because
+    a turn built from a transcript nobody stored is the single thing the "write
+    it the moment it exists" rule exists to prevent - the retry would pay for a
+    second transcription and could hear something different.
+    """
+
+    def __init__(self, error_class: str) -> None:
+        self.error_class = error_class
+        super().__init__(f"voice note not recorded: {error_class}")
+
+
 class BookingStateNotRecordedError(RepositoryError):
     """Recording a booking action failed (VS-007).
 
