@@ -19,6 +19,22 @@ from typing import Any
 # it would mean echoing model-written text - `extra_forbidden`'s `loc` IS the
 # key the model invented (U5) - or where the problem is about the pair of values
 # rather than one field.
+FIELD_PROBLEMS: dict[tuple[str, str], str] = {
+    # VS-007. Looked up by (type, field) BEFORE the by-type table below, so the
+    # window messages VS-006 pins for `start` and `end` are untouched while the
+    # new id and name arguments get advice the model can act on.
+    ("string_pattern_mismatch", "slot_id"): (
+        "must be a slot_id copied exactly from search_available_slots"
+    ),
+    ("string_pattern_mismatch", "appointment_id"): (
+        "must be an appointment_id copied exactly from list_my_appointments"
+    ),
+    ("string_too_short", "full_name"): "must be the patient's full name",
+    ("name_too_short", "full_name"): "must be the patient's full name",
+    ("name_has_digits", "full_name"): "must be a person's name, with no digits",
+    ("name_not_printable", "full_name"): "must be a person's name, with no hidden characters",
+}
+
 PROBLEMS: dict[str, tuple[bool, str]] = {
     # (name_the_field, message)
     "missing": (True, "is required"),
@@ -56,6 +72,82 @@ UNAVAILABLE_MESSAGE = (
     "The clinic's booking system could not be reached. Do not guess: tell the patient "
     "the clinic team will get back to them."
 )
+
+# VS-007's booking errors and refusals, keyed by our own code. Fixed text: the
+# model reads these and acts on them, so each says what to do next, and none is
+# built from a value the model or the service supplied.
+#
+# Three of them carry the whole weight of hard rule 5:
+#  - `slot_taken` and `hold_expired` both say "nothing was held or booked", so the
+#    model cannot read a failure as a success;
+#  - `outcome_unknown` forbids BOTH claims. It is the only honest answer when a
+#    write's result was lost, and the one a model is most likely to get wrong.
+BOOKING_MESSAGES: dict[str, str] = {
+    "slot_taken": (
+        "Someone else took that time just now, so nothing was held or booked. "
+        "Search again and offer the patient other available times."
+    ),
+    "slot_not_found": (
+        "No available time has that slot_id. Use a slot_id from "
+        "search_available_slots, copied exactly; never make one up."
+    ),
+    "appointment_not_found": (
+        "This patient has no upcoming appointment with that appointment_id. "
+        "Call list_my_appointments to get the ids."
+    ),
+    "hold_expired": (
+        "The hold on that time ran out, so nothing was booked or changed. "
+        "Search again and offer the patient available times."
+    ),
+    "booking_validation": VALIDATION_MESSAGE,
+    "booking_unavailable": (
+        "The clinic's booking system could not be reached, so nothing was changed. "
+        "Do not guess: tell the patient the clinic team will get back to them."
+    ),
+    "outcome_unknown": (
+        "The booking system did not confirm what happened, so nobody knows yet "
+        "whether this worked. Never say that it worked and never say that it "
+        "failed: tell the patient the clinic team will check and get back to them."
+    ),
+    "nothing_to_confirm": (
+        "No held time is waiting for this patient's confirmation. Search, call "
+        "hold_appointment_slot, tell the patient the details and ask them to "
+        "confirm first."
+    ),
+    "confirmation_needed": (
+        "The patient has not confirmed this yet: it was prepared while answering "
+        "this same message, or they have not seen the details. Tell the patient "
+        "the details, ask them to confirm, and wait for their reply."
+    ),
+    "one_change_per_message": (
+        "Only one booking change can be made per patient message, and one was "
+        "already made. Tell the patient what happened and ask what they want next."
+    ),
+    "turn_time_low": (
+        "There is not enough time left to change the booking safely, so nothing "
+        "was changed. Ask the patient to send their confirmation again."
+    ),
+}
+
+
+class ToolFailure(Exception):
+    """OUR code declined to run a booking change, or refused it outright.
+
+    Not a `BookingError`: nothing was sent to the Booking Service, so nothing can
+    have happened. Not a `ToolCrashed` either: this is a rule working as intended,
+    and the model is told what to do about it.
+
+    Every one of these is recorded `REFUSED` with the code as its `error_code`
+    (V3's gate, V12's one change per message, V15's budget floor). That status
+    exists so an operator can tell "we declined" from "the model got it wrong"
+    (`INVALID_ARGUMENTS`) and from "the service failed" (`ERROR`).
+    """
+
+    def __init__(self, code: str) -> None:
+        if code not in BOOKING_MESSAGES:
+            raise ValueError("unknown tool failure code")
+        self.code = code
+        super().__init__(code)
 
 
 class ToolCrashed(Exception):
@@ -97,9 +189,18 @@ def problems_from(errors: list[dict[str, Any]], allowed: tuple[str, ...]) -> lis
     seen: set[tuple[str | None, str]] = set()
     for error in errors:
         error_type = str(error.get("type", ""))
-        name_field, template = PROBLEMS.get(error_type, (True, FALLBACK_PROBLEM))
         loc = error.get("loc") or ()
-        field = str(loc[0]) if loc and isinstance(loc[0], str) else None
+        raw_field = str(loc[0]) if loc and isinstance(loc[0], str) else None
+        # FIELD_PROBLEMS first (VS-007): a `string_pattern_mismatch` on `slot_id`
+        # needs different advice from one on `start`, and looking the pair up
+        # first is what lets VS-006's window messages stay exactly as they were.
+        # Only a field WE declared can reach this lookup.
+        specific = FIELD_PROBLEMS.get((error_type, raw_field)) if raw_field in declared else None
+        if specific is not None:
+            name_field, template = True, specific
+        else:
+            name_field, template = PROBLEMS.get(error_type, (True, FALLBACK_PROBLEM))
+        field = raw_field
         # The last line of defence: even when the table says "name the field",
         # only a field we declared is ever echoed.
         if not name_field or field not in declared:

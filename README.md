@@ -228,19 +228,95 @@ clinic's current date and time in **Asia/Beirut**, tomorrow's date, and the next
 seven dates with weekday names. `tzdata` is a runtime dependency because Windows
 hosts have no system time zone database.
 
-**The limits.** One turn makes at most **4 model calls** and runs under one
-deadline, `AGENT_TURN_TIMEOUT_SECONDS` (default 45). Four is three for the
-normal flow - list, search, answer - plus one for a single self-correction after
-an invalid-arguments error. `JOB_TIMEOUT_SECONDS` rose **60 → 90** to cover the
-turn plus the Meta send (45 + 10 = 55), which puts the claim lease at 120s.
+**The limits.** One turn makes at most **6 model calls** (4 before VS-007) and
+runs under one deadline, `AGENT_TURN_TIMEOUT_SECONDS` (default 45). Six, because
+the longest normal flow is now five calls - a reschedule: list appointments, list
+doctors, search, hold, answer - and the margin for one self-correction has to sit
+on top of the longest flow rather than the shortest. `JOB_TIMEOUT_SECONDS` is 90,
+covering the turn plus the Meta send (45 + 10 = 55), which puts the claim lease at
+120s. A turn also makes **at most one booking change** (see Booking below).
 
 **New dead-letter reasons**, all `replied_fallback` (the patient WAS answered):
 
 | Reason | What it means |
 |---|---|
-| `agent_max_model_calls` | the model still wanted tools on its 4th call. Permanent — a retry would loop the same way. |
+| `agent_max_model_calls` | the model still wanted tools on its 6th call. Permanent — a retry would loop the same way. |
 | `agent_turn_timeout` | the whole turn passed `AGENT_TURN_TIMEOUT_SECONDS`. Retried with backoff; falls back on the last try. |
 | `agent_tool_crashed` | a bug in our tool code. The dead letter carries the exception class name only. |
+
+### Booking (VS-007)
+
+The model can now **hold, book, move and cancel** appointments for the patient it
+is talking to. It still never runs anything itself, and three rules are enforced
+in CODE rather than in the prompt.
+
+**The five new tools:**
+
+| Tool | What it does |
+|---|---|
+| `list_my_appointments` | this patient's upcoming appointments, each with its `appointment_id`. Takes no arguments at all. |
+| `hold_appointment_slot` | puts one available time on hold for a few minutes. Also prepares a MOVE, when given the `appointment_id` being moved. **A hold is not a booking.** |
+| `book_appointment` | books the held time. Takes the patient's `full_name` and nothing else. |
+| `reschedule_appointment` | moves the appointment onto the new hold. Takes no arguments: both ids come from our own table. |
+| `cancel_appointment` | the FIRST call prepares a cancellation and cancels nothing; a second call with the same `appointment_id` executes it. |
+
+**Two messages for every change.** A change is *prepared* while answering one
+patient message and can only be *executed* while answering a later one - and only
+after a reply of ours was **actually sent** in between. That last condition is the
+important one: a patient cannot confirm something they were never told, so two
+quick messages do not count as a confirmation, and neither does a message
+answering a reply Meta refused. The rule lives in SQL (`booking_actions`, and
+`state_for`'s `confirmable`), so a tool cannot half-apply it.
+
+**The receipt line.** Our code appends one line to the reply, built only from what
+the Booking Service answered - never from the model's wording. The model is
+forbidden to write these symbols itself:
+
+| Line | Meaning |
+|---|---|
+| `⏳ Dr. Karim Haddad · 2026-09-30 14:00` | held, or a prepared cancellation (`⏳ ❌ …`). **Nothing is booked.** |
+| `✅ Dr. Karim Haddad · 2026-09-30 14:00 · #K7Q2M9` | booked, confirmed by the clinic's system. The `#` code is the patient's reference. |
+| `🔁 … · #K7Q2M9` | moved. |
+| `❌ … · #K7Q2M9` | cancelled. |
+
+A booking that needs the clinic's approval gets `⏳`, not `✅`.
+
+**The reply guard.** Before a reply goes out, the model's own words are scanned
+for booking, cancellation and change claims in Arabic, Arabizi, French and
+English. A claim the turn's own tool results do not support is replaced with
+`AGENT_FALLBACK_REPLY` and dead-lettered (`agent_unconfirmed_claim`). It is not
+perfect - a question like "would you like it booked?" is flagged, and some
+paraphrases slip through - so the `✅` line, not the sentence above it, is the
+proof a patient can rely on.
+
+> **Bookings are FAKE, and they live in this worker's memory.** VS-007's
+> stand-in holds real holds and real appointments - but in RAM. They are **lost on
+> every restart**, and two workers would each have their own set, so a patient
+> could see different availability from one message to the next. **Run exactly one
+> worker**, and never put it in front of real patients. The worker says so on every
+> start. VS-011 connects the real Booking Service.
+
+**New dead-letter reasons** (the inbox row is `PROCESSED` for all of them — the
+patient was answered, or deliberately not answered):
+
+| Reason | What a human does |
+|---|---|
+| `booking_uncertain` | a booking call whose answer was lost. Find the request at the Booking Service by the `idempotency_key` in the dead letter's `booking` block, then tell the patient. **The patient was told neither that it worked nor that it failed.** |
+| `booking_idempotency_conflict` | the same, plus a bug in our key derivation: the same key was sent with a different body. |
+| `booking_changed_reply_dropped` | a change succeeded and a human had taken the conversation over, so nothing was sent. The `booking_actions` row says what changed; tell the patient. |
+| `booking_state_not_recorded` | the change happened and our table could not record it. Reconcile `booking_actions` by hand; the reply went out. |
+| `agent_unconfirmed_claim` | the guard replaced a reply. Read that turn's `tool_executions`; the patient got the fallback. |
+
+**Reading `booking_actions`** — ids and codes only, never a name, a time or a
+doctor:
+
+```powershell
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select created_at, kind, status, error_code, hold_expires_at, appointment_id from booking_actions order by created_at desc limit 20;"
+docker compose exec postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select status, count(*) from booking_actions group by status order by 2 desc;"
+```
+
+`UNCERTAIN` rows are the ones that need a person. `last_idempotency_key` is safe
+to quote to the Booking Service: it is a one-way hash and reveals nothing.
 
 ### Reading the tables
 
@@ -308,3 +384,8 @@ once the lease expires (`JOB_TIMEOUT_SECONDS + JOB_LEASE_MARGIN_SECONDS`).
 | `replied_fallback` + `agent_turn_timeout` | the whole turn was too slow. `agent_runs.duration_ms` and `model_calls` say where it went. |
 | `replied_fallback` + `agent_tool_crashed` | a bug in our tool code. The dead letter names the exception class; the `tool_executions` row names the tool. |
 | a reply naming times the clinic does not have | the booking data is the **fake** (see the warning above), not a real schedule. |
+| `replied_fallback` + `agent_unconfirmed_claim` | the model claimed a booking, cancellation or change the turn did not make. The patient got the fallback. Read that turn's `tool_executions`. |
+| a hold that "ran out" seconds after it was made | the worker restarted: the in-memory service lost every hold and booking. Run ONE worker, and do not restart it mid-conversation. |
+| `booking_uncertain` in a dead letter | a booking call's answer was lost. **Nobody knows whether it worked**, including the patient. Quote the `idempotency_key` to the Booking Service. |
+| `book_appointment` refused with `confirmation_needed` | working as intended: the patient has not confirmed in a LATER message, or our reply describing the hold never went out. |
+| `book_appointment` refused with `turn_time_low` | `AGENT_TURN_TIMEOUT_SECONDS` left under 8s when the model tried to book. Raise it, or expect the patient to be asked to confirm again. |

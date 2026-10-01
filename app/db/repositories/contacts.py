@@ -28,6 +28,29 @@ class ContactRepository(TenantScopedRepository):
             )
         )
 
+    async def external_id(self, contact_id: uuid.UUID, channel: str) -> str | None:
+        """This contact's stored identity on one channel: their WhatsApp number.
+
+        VS-007 needs it because the Booking Service asked for the patient's phone
+        number as the patient reference (V14 as the developer overrode it). T1 reads
+        it here rather than taking the one off the Meta payload, so the value that
+        goes to the Booking Service is the value we STORED - one source of truth,
+        and the same on a retry whatever the payload happened to carry.
+
+        Selects the COLUMN, never the entity: nothing needs a `ContactIdentity`
+        object, and a column select cannot be served stale from the identity map.
+
+        Tenant-scoped like every read here: a correct contact id from the wrong
+        tenant returns None rather than another clinic's patient (hard rule 4).
+        """
+        return await self._session.scalar(
+            sa.select(ContactIdentity.external_id).where(
+                ContactIdentity.contact_id == contact_id,
+                ContactIdentity.tenant_id == self.tenant_id,
+                ContactIdentity.channel == str(channel),
+            )
+        )
+
     async def get_or_create_by_identity(
         self, channel: str, external_id: str, display_name: str | None = None
     ) -> Contact:

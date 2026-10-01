@@ -188,10 +188,18 @@ async def test_the_tool_loop_on_the_wire_never_sends_the_tenant_or_patient_ident
     # Every request offers the same three tools, in the same order - which is
     # what OpenAI's automatic prompt caching needs.
     for body in bodies:
+        # All EIGHT since VS-007, in the registry's fixed order: the whole list
+        # goes out on every call, and a changing order would defeat OpenAI's
+        # automatic prompt caching.
         assert [t["function"]["name"] for t in body["tools"]] == [
             "get_clinic_information",
             "list_doctors",
             "search_available_slots",
+            "list_my_appointments",
+            "hold_appointment_slot",
+            "book_appointment",
+            "reschedule_appointment",
+            "cancel_appointment",
         ]
         assert all(t["type"] == "function" for t in body["tools"])
 

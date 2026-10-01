@@ -11,6 +11,8 @@ from typing import Any
 
 from app.db.enums import (
     AgentRunOutcome,
+    BookingActionKind,
+    BookingActionStatus,
     Channel,
     ConversationState,
     InboxStatus,
@@ -21,6 +23,7 @@ from app.db.enums import (
 )
 from app.db.models import (
     AgentRun,
+    BookingAction,
     Contact,
     ContactIdentity,
     Conversation,
@@ -164,3 +167,28 @@ def make_tool_execution(run: AgentRun, sequence: int = 0, **overrides: Any) -> T
     }
     values.update(overrides)
     return ToolExecution(**values)
+
+
+def make_booking_action(
+    conversation: Conversation, inbound: Message, **overrides: Any
+) -> BookingAction:
+    """A PENDING hold, prepared while answering `inbound`.
+
+    Ids, codes and one operational expiry - there is nothing else this table may
+    hold (hard rule 8), which is why the factory takes no text at all.
+
+    `hold_expires_at` is left to the caller, because the two clocks matter here: a
+    test that wants the hold to lapse sets it against the INJECTED clock it also
+    gives the service, never against PostgreSQL's now() (plan risk R5).
+    """
+    values: dict[str, Any] = {
+        "tenant_id": conversation.tenant_id,
+        "conversation_id": conversation.id,
+        "kind": BookingActionKind.BOOK.value,
+        "status": BookingActionStatus.PENDING.value,
+        "hold_id": "hold_1",
+        "created_by_inbox_event_id": uuid.uuid4(),
+        "created_by_inbound_message_id": inbound.id,
+    }
+    values.update(overrides)
+    return BookingAction(**values)

@@ -10,10 +10,16 @@ from app.db.repositories.agent_runs import (
     AgentRunRow,
     ToolExecutionRow,
 )
+from app.db.repositories.booking_actions import (
+    BookingActionRepository,
+    BookingOutcomeRow,
+    BookingStateRow,
+)
 from app.db.repositories.contacts import ContactRepository
 from app.db.repositories.conversations import ConversationRepository
 from app.db.repositories.dead_letter import DeadLetterJobRepository
 from app.db.repositories.errors import (
+    BookingStateNotRecordedError,
     DuplicateRecordError,
     RepositoryError,
     RunNotRecordedError,
@@ -25,6 +31,10 @@ from app.db.repositories.webhook_inbox import ClaimResult, WebhookInboxRepositor
 __all__ = [
     "AgentRunRepository",
     "AgentRunRow",
+    "BookingActionRepository",
+    "BookingOutcomeRow",
+    "BookingStateNotRecordedError",
+    "BookingStateRow",
     "ClaimResult",
     "ContactRepository",
     "ConversationRepository",

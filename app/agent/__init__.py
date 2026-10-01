@@ -13,6 +13,7 @@ from app.agent.core import (
     build_messages,
     process_turn,
 )
+from app.agent.guard import allowed_claims, claims_in, compose_reply, unconfirmed_claims
 from app.agent.history import (
     NON_TEXT_PLACEHOLDER,
     VOICE_NOTE_PLACEHOLDER,
@@ -22,30 +23,53 @@ from app.agent.history import (
 )
 from app.agent.loop import MAX_MODEL_CALLS, MAX_TOOL_CALLS_PER_TURN
 from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION
-from app.agent.tools import ToolCallRecord, ToolContext, ToolExecutionStatus, default_registry
+from app.agent.tools import (
+    MAX_BOOKING_CHANGES_PER_TURN,
+    MIN_SECONDS_FOR_A_BOOKING_CHANGE,
+    BookingOutcome,
+    BookingState,
+    ChangePhase,
+    ChangeStatus,
+    PatientContext,
+    ToolCallRecord,
+    ToolContext,
+    ToolExecutionStatus,
+    default_registry,
+)
 
 __all__ = [
     "CLINIC_TIMEZONE",
     "CLINIC_TZ",
+    "MAX_BOOKING_CHANGES_PER_TURN",
     "MAX_MODEL_CALLS",
     "MAX_TOOL_CALLS_PER_TURN",
+    "MIN_SECONDS_FOR_A_BOOKING_CHANGE",
     "NON_TEXT_PLACEHOLDER",
     "SYSTEM_PROMPT",
     "SYSTEM_PROMPT_VERSION",
     "VOICE_NOTE_PLACEHOLDER",
     "AgentResult",
     "AgentRuntime",
+    "BookingOutcome",
+    "BookingState",
+    "ChangePhase",
+    "ChangeStatus",
     "Clock",
     "HistoryEntry",
+    "PatientContext",
     "ToolCallRecord",
     "ToolContext",
     "ToolExecutionStatus",
     "Turn",
+    "allowed_claims",
     "build_messages",
+    "claims_in",
     "clock_message",
+    "compose_reply",
     "content_for",
     "default_registry",
     "process_turn",
     "to_chat_messages",
+    "unconfirmed_claims",
     "utc_now",
 ]

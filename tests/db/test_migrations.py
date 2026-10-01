@@ -24,6 +24,8 @@ LIFECYCLE_DATABASE_NAME = "doctoleb_test_migrations"
 # move what they are testing (plan Task 1, Step 1).
 VS004_REVISION = "22a816a5a08d"
 TENANT_TEXT_REVISION = "4f3c8d21a90e"
+AGENT_RUNS_REVISION = "50a570a315fb"
+BOOKING_ACTIONS_REVISION = "b919820bf52e"
 
 EXPECTED_TABLES = {
     "webhook_inbox",
@@ -34,6 +36,7 @@ EXPECTED_TABLES = {
     "dead_letter_jobs",
     "agent_runs",
     "tool_executions",
+    "booking_actions",
     "alembic_version",
 }
 
@@ -170,7 +173,7 @@ def test_models_and_migrations_do_not_drift(migrated_database: str):
 
 
 def test_one_step_downgrade_and_upgrade_is_repeatable(lifecycle_url: str):
-    """VS-004's migration, specifically: head -> -1 -> head.
+    """The newest migration, specifically: head -> -1 -> head.
 
     The base-to-head round trip above would still pass if the newest revision's
     downgrade dropped a table its upgrade never created, because everything is
@@ -310,3 +313,79 @@ def test_downgrade_refuses_a_tenant_id_that_is_not_a_uuid(lifecycle_url: str):
     _execute(lifecycle_url, "delete from contacts")
     command.downgrade(config, VS004_REVISION)
     assert _rows(lifecycle_url, "select version_num from alembic_version") == [(VS004_REVISION,)]
+
+
+def _revision(url: str) -> str | None:
+    async def _read() -> str | None:
+        engine = create_async_engine(url)
+        try:
+            async with engine.connect() as connection:
+                return await connection.scalar(sa.text("select version_num from alembic_version"))
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_read())
+
+
+def test_the_booking_revision_widens_the_tool_status_check_and_narrows_it_back(lifecycle_url: str):
+    """VS-007's migration, and the one thing autogenerate cannot see.
+
+    Alembic never compares CHECK constraints, so the widening of
+    ck_tool_executions_status_valid to accept UNCERTAIN and REFUSED is invisible to
+    the drift test. This walks it by hand:
+
+      upgrade to b919820bf52e   -> an UNCERTAIN tool row is accepted
+      downgrade to 50a570a315fb -> FAILS, because that row exists
+      delete the row
+      downgrade again            -> succeeds, and booking_actions is gone
+
+    The failing downgrade is the point. Narrowing the CHECK while an UNCERTAIN row
+    exists would mean rewriting a recorded fact - claiming a booking-changing call
+    whose outcome we never learned was an ERROR - to make a downgrade succeed. The
+    whole downgrade runs in one transaction, so the failure leaves the database
+    exactly where it was.
+    """
+    config = alembic_config(lifecycle_url)
+    command.upgrade(config, BOOKING_ACTIONS_REVISION)
+    assert "booking_actions" in _table_names(lifecycle_url)
+
+    contact, conversation = uuid.uuid4(), uuid.uuid4()
+    message, run, tool = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tenant = "clinic-alpha"
+    _execute(
+        lifecycle_url,
+        f"insert into contacts (id, tenant_id) values ('{contact}', '{tenant}')",
+        "insert into conversations (id, tenant_id, contact_id, channel, state) "
+        f"values ('{conversation}', '{tenant}', '{contact}', 'whatsapp', 'AI_ACTIVE')",
+        "insert into messages (id, tenant_id, conversation_id, direction, modality, status) "
+        f"values ('{message}', '{tenant}', '{conversation}', 'INBOUND', 'TEXT', 'RECEIVED')",
+        "insert into agent_runs (id, tenant_id, inbox_event_id, conversation_id, "
+        "inbound_message_id, job_try, prompt_version, outcome, reason, model_calls, duration_ms) "
+        f"values ('{run}', '{tenant}', '{uuid.uuid4()}', '{conversation}', '{message}', 1, "
+        "'vs007-1', 'SUCCESS', 'ok', 1, 5)",
+        # Accepted only because of this revision's widened CHECK.
+        "insert into tool_executions (id, agent_run_id, tenant_id, sequence, model_call, "
+        "tool_name, argument_names, status, duration_ms) "
+        f"values ('{tool}', '{run}', '{tenant}', 0, 1, 'book_appointment', '{{}}', "
+        "'UNCERTAIN', 7)",
+    )
+
+    try:
+        with pytest.raises(Exception):  # noqa: B017,PT011 - a wrapped CheckViolation
+            command.downgrade(config, AGENT_RUNS_REVISION)
+        assert _revision(lifecycle_url) == BOOKING_ACTIONS_REVISION
+        assert "booking_actions" in _table_names(lifecycle_url)
+
+        _execute(lifecycle_url, f"delete from tool_executions where id = '{tool}'")
+        command.downgrade(config, AGENT_RUNS_REVISION)
+
+        assert _revision(lifecycle_url) == AGENT_RUNS_REVISION
+        assert "booking_actions" not in _table_names(lifecycle_url)
+    finally:
+        # These rows carry an OPAQUE tenant id (decision D1), and the next test's
+        # fixture downgrades to base - which passes through the tenant-text
+        # migration's `USING tenant_id::uuid`. Leaving them behind would make every
+        # later migration test fail on "invalid input syntax for type uuid".
+        # Deleting the contact cascades to the conversation, its message, its run
+        # and its tool rows.
+        _execute(lifecycle_url, f"delete from contacts where id = '{contact}'")

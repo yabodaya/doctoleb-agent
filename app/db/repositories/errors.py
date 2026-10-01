@@ -89,3 +89,23 @@ class RunNotRecordedError(RepositoryError):
     def __init__(self, error_class: str) -> None:
         self.error_class = error_class
         super().__init__(f"agent run not recorded: {error_class}")
+
+
+class BookingStateNotRecordedError(RepositoryError):
+    """Recording a booking action failed (VS-007).
+
+    The same shape and the same reasoning as `RunNotRecordedError`: the exception
+    CLASS name and nothing else, raised `from None` so no chained traceback
+    survives to print the statement.
+
+    A distinct type because the caller's reaction is distinct. A booking outcome
+    that could not be written is worse than a cost record that could not be
+    written: the Booking Service has changed something our table does not know
+    about. So the job logs it, writes a dead letter, and still sends the reply -
+    the change happened, and the patient's receipt is built from the service's own
+    answer, not from this row.
+    """
+
+    def __init__(self, error_class: str) -> None:
+        self.error_class = error_class
+        super().__init__(f"booking action not recorded: {error_class}")

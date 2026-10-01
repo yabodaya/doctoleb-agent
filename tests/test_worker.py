@@ -1,3 +1,4 @@
+import datetime as dt
 import os
 
 from arq.connections import RedisSettings
@@ -114,3 +115,72 @@ def test_a_fully_configured_worker_warns_only_about_the_fake_booking_client():
     guarantee.
     """
     assert [w for w in startup_warnings(_settings()) if "FAKE" not in w] == []
+
+
+# --------------------------------------------------------------------------
+# VS-007: the booking service, and the budget floor
+# --------------------------------------------------------------------------
+
+
+def test_the_fake_warning_says_bookings_are_lost_on_restart_and_to_run_one_worker():
+    """Risk R8, widened. In VS-006 the fake served availability; now it holds HOLDS
+    and BOOKINGS in this process's memory.
+
+    Two new facts an operator has to know: a restart loses every hold and booking, so
+    `booking_actions` rows point at holds nothing knows about; and two workers would
+    each have their own set, so the same patient would see different availability from
+    one message to the next.
+    """
+    fake = [w for w in startup_warnings(_settings()) if "FAKE" in w]
+
+    assert len(fake) == 1
+    assert "holds and bookings are demo data" in fake[0]
+    assert "lost on every restart" in fake[0]
+    assert "run ONE worker" in fake[0]
+    # And the three substrings the VS-006 test asserts are still there.
+    assert "booking service" in fake[0]
+    assert "demo data" in fake[0]
+    assert "never put this worker in front of real patients" in fake[0]
+
+
+def test_startup_warns_when_the_turn_budget_cannot_fit_a_booking_change():
+    """V15's floor, as a warning rather than a boot failure.
+
+    Below it no change can ever START: every confirmation would be refused with
+    `turn_time_low` and the patient asked to send it again, forever - which looks like
+    a model problem and is a settings problem. A warning, not a refusal to boot, for
+    the same reason as the job-timeout one: the api must not refuse to boot over a
+    worker knob (VS-005 A14).
+    """
+    from app.agent.tools import MIN_SECONDS_FOR_A_BOOKING_CHANGE
+
+    assert [
+        w for w in startup_warnings(_settings()) if "MIN_SECONDS_FOR_A_BOOKING_CHANGE" in w
+    ] == []
+
+    too_small = _settings(agent_turn_timeout_seconds=MIN_SECONDS_FOR_A_BOOKING_CHANGE)
+    warnings = [w for w in startup_warnings(too_small) if "MIN_SECONDS" in w]
+
+    assert len(warnings) == 1
+    assert "AGENT_TURN_TIMEOUT_SECONDS=8" in warnings[0]
+    assert "no booking change can ever start" in warnings[0]
+
+
+async def test_the_worker_builds_one_service_for_both_booking_roles():
+    """One instance, deliberately.
+
+    It implements both Protocols, and two instances would mean a hold made through
+    one being invisible to the other - the same slot offered to two patients. Built by
+    a helper `startup()` calls, so the `asyncio.Lock` belongs to arq's running loop
+    (plan check U5).
+    """
+    from app.integrations.booking import BookingClient, PatientBookingClient
+    from app.worker.main import booking_backends
+
+    service = booking_backends(lambda: dt.datetime(2026, 9, 29, 7, tzinfo=dt.UTC))
+
+    assert isinstance(service, BookingClient)
+    assert isinstance(service, PatientBookingClient)
+    # A second call is a DIFFERENT instance: nothing is shared at module level, so a
+    # test never inherits another test's holds.
+    assert booking_backends(lambda: dt.datetime(2026, 9, 29, 7, tzinfo=dt.UTC)) is not service

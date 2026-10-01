@@ -20,7 +20,9 @@ class ConversationRepository(TenantScopedRepository):
             )
         )
 
-    async def current_state(self, conversation_id: uuid.UUID) -> str | None:
+    async def current_state(
+        self, conversation_id: uuid.UUID, *, for_update: bool = False
+    ) -> str | None:
         """Read this conversation's state FROM THE DATABASE, always.
 
         Hard rule 7 re-reads the state immediately before sending, to catch a
@@ -38,13 +40,26 @@ class ConversationRepository(TenantScopedRepository):
         actually needs.
 
         Returns None for a missing conversation, or for another tenant's id.
+
+        `for_update=True` adds `FOR UPDATE`, which VS-007's T1b and T1r use when the
+        turn carries a booking outcome. It has to be the FIRST statement of those
+        transactions: two quick messages can each produce a turn with an outcome, and
+        without the lock both would supersede the same PENDING row and both insert a
+        new one - the second violating the partial unique index. The reply's own
+        insert takes a KEY SHARE lock on this row through its foreign key, so a lock
+        taken AFTER it could deadlock two T1b's; taken first, the second simply waits
+        a few milliseconds (plan check U8). A staff takeover waits only for that
+        commit, never for OpenAI or the Booking Service.
+
+        Still a COLUMN select either way - the reason above is unchanged by the lock.
         """
-        return await self._session.scalar(
-            sa.select(Conversation.state).where(
-                Conversation.id == conversation_id,
-                Conversation.tenant_id == self.tenant_id,
-            )
+        statement = sa.select(Conversation.state).where(
+            Conversation.id == conversation_id,
+            Conversation.tenant_id == self.tenant_id,
         )
+        if for_update:
+            statement = statement.with_for_update()
+        return await self._session.scalar(statement)
 
     async def get_open(self, contact_id: uuid.UUID, channel: str) -> Conversation | None:
         """The one non-CLOSED conversation, if there is one.

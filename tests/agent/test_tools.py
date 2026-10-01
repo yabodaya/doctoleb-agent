@@ -142,25 +142,48 @@ async def test_results_are_clinic_local_times_with_day_names():
     assert payload["doctor_id"] == "doc_karim"
     assert payload["timezone"] == "Asia/Beirut"
     assert payload["searched"] == {"start": "2026-09-30T12:00", "end": "2026-09-30T17:00"}
-    assert payload["slots"] == [
+    # `slot_id` was added in VS-007 (V10), so it is compared separately from the
+    # times: what this test is about is the SPELLING of the times, and the ids the
+    # frozen fake issues are pinned in tests/integrations/test_fake_booking.py.
+    assert [
+        {key: value for key, value in slot.items() if key != "slot_id"} for slot in payload["slots"]
+    ] == [
         {"day": "Wednesday", "start": "2026-09-30T14:00", "end": "2026-09-30T14:20"},
         {"day": "Wednesday", "start": "2026-09-30T14:20", "end": "2026-09-30T14:40"},
         {"day": "Wednesday", "start": "2026-09-30T15:40", "end": "2026-09-30T16:00"},
         {"day": "Wednesday", "start": "2026-09-30T16:20", "end": "2026-09-30T16:40"},
     ]
+    assert all(slot["slot_id"] for slot in payload["slots"])
     assert payload["more_available"] is False
 
 
-async def test_results_expose_no_slot_id():
-    """Nothing in VS-006 can act on one, and an id the model can see but cannot
-    use invites it to claim it has reserved something (hard rule 5). VS-007 adds
-    it with the tool that uses it."""
+async def test_results_expose_each_slots_id():
+    """INVERTED deliberately in VS-007 (plan conflict C4).
+
+    VS-006 hid `slot_id` because nothing could act on one, and an id the model can
+    see but cannot use invites it to claim it has reserved something. Now
+    `hold_appointment_slot` takes one, so hiding it would mean asking the model to
+    name a time in words and having our code guess which slot it meant.
+
+    What stops the model inventing or reusing one (V10): the ids are opaque tokens
+    only the issuing service can resolve; `OPAQUE_ID` refuses anything with a space
+    in it, so "14:00 tomorrow" is invalid arguments; an unknown id is the fixed
+    error `slot_not_found`; and the prompt forbids writing an id into a reply.
+    """
     payload, _ = await call(
         "search_available_slots",
         {"doctor_id": "doc_karim", "start": "2026-09-30T12:00", "end": "2026-09-30T17:00"},
     )
 
-    assert "slot_id" not in json.dumps(payload)
+    assert payload["slots"], "the demo clinic has Wednesday afternoon slots"
+    for slot in payload["slots"]:
+        assert slot["slot_id"]
+    # The FAKE's ids are transparent here, because this test calls the frozen fake
+    # directly rather than the in-memory service that tokenises them. That is the
+    # honest boundary: this tool passes through whatever id its client issued, and
+    # tests/integrations/test_memory_booking.py is where the tokens are pinned.
+    assert "hold_id" not in json.dumps(payload)
+    assert "reference" not in json.dumps(payload)
 
 
 async def test_a_start_in_the_past_is_clamped_to_now():

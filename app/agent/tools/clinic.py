@@ -15,6 +15,8 @@ class GetClinicInformation:
     name = "get_clinic_information"
     description = DESCRIPTION
     args_model = NoArguments
+    # Read-only: nothing here can change a booking (VS-007).
+    changes_bookings = False
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> dict[str, Any]:
         return as_payload(await ctx.booking.get_clinic(ctx.tenant_id))
