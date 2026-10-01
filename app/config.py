@@ -105,17 +105,20 @@ class Settings(BaseSettings):
     job_max_tries: int = 5
     job_backoff_base_seconds: float = 5.0
     job_backoff_max_seconds: float = 300.0
-    # Must stay above agent_turn_timeout_seconds + meta_send_timeout_seconds
-    # (decision D4; 45 + 10 = 55, so 90 leaves 35s for the job's four short
-    # transactions - five when VS-007's T1r records a booking change on the
-    # retry path). NOT openai_timeout_seconds: every model call now runs
-    # inside the turn budget, so the loop is what this has to cover.
+    # Must stay above voice_note_budget_seconds + agent_turn_timeout_seconds +
+    # meta_send_timeout_seconds (decision D4, extended by VS-008's conflict C5:
+    # 40 + 45 + 10 = 95, so 140 leaves 45s for the job's five or six short
+    # transactions - T0, T1, T1a, T1b, T2, and VS-007's T1r on the retry path).
+    # It was 90 until VS-008, which is BELOW that 95: a voice turn makes two
+    # media calls and a transcription before the turn even starts.
+    # NOT openai_timeout_seconds: every model call runs inside the turn budget,
+    # so the loop is what this has to cover.
     #
     # A job arq times out is finished as failed and never retried, and none of
     # our exit paths run: no dead letter, no lease release, and nothing
     # re-enqueues the event. tests/test_config.py pins the relation on the
     # defaults, and the worker warns at startup when a deployment breaks it.
-    job_timeout_seconds: float = 90.0
+    job_timeout_seconds: float = 140.0
     # Added to job_timeout_seconds to get the claim lease (plan note C3a). The
     # lease MUST outlive the job: if it expires while the job is still inside
     # the Meta call, a second worker claims the same event and sends the same
@@ -143,6 +146,49 @@ class Settings(BaseSettings):
     # (plan assumption A3). Only generated tokens are billed.
     openai_max_output_tokens: int = Field(default=1000, gt=0)
 
+    # OpenAI audio (VS-008). The key has been in .env.example since the first
+    # commit; this is the first slice that reads it.
+    #
+    # No default, on purpose: model names come from env vars, never from code.
+    # Blank = permanent failure `openai_transcribe_model_unset`, and the patient
+    # gets voice_note_failed_reply, which tells them to type instead. The worker
+    # warns about it at startup, because "voice notes never work" otherwise
+    # looks like a bug rather than a missing .env entry.
+    openai_transcribe_model: str = ""
+    # ONE transcription attempt, as a WALL-CLOCK deadline - the SDK's own
+    # timeout applies per connection phase. Outside the turn budget: the turn
+    # has not started yet when this runs.
+    openai_transcribe_timeout_seconds: float = Field(default=20.0, gt=0)
+
+    # Meta media (VS-008). ONE attempt, applied separately to the lookup and to
+    # the download, so the pair is at most twice this.
+    meta_media_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The hard ceiling on a download, enforced against the declared file_size
+    # AND while streaming. 16 MiB is Meta's own documented maximum for audio,
+    # and the audio endpoint's request limit is higher still, so this is the
+    # binding one. It is also the only thing standing between a forged payload
+    # and an unbounded allocation inside the job (plan risk R5).
+    voice_note_max_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    # Sent when a voice note transcribed to nothing usable (W5). It must ask for
+    # an ACTION - record it again or type it - because that is the patient's
+    # next step, and it must claim nothing about the clinic. Arabic and English
+    # in one message: on this path nothing was transcribed, so the patient's
+    # language is unknown.
+    voice_note_unclear_reply: str = (
+        "Sorry, I couldn't hear that voice note clearly. Could you record it "
+        "again or type your message? / عذراً، لم أتمكن من سماع الرسالة الصوتية "
+        "بوضوح. هل يمكنك تسجيلها مرة أخرى أو كتابة رسالتك؟"
+    )
+    # Sent when we could not get or transcribe the audio at all (W6). Specific,
+    # NOT agent_fallback_reply: "the clinic will get back to you" is untrue of a
+    # voice note nobody will ever hear, and "type your message, or send a
+    # shorter one" is the only useful thing to say.
+    voice_note_failed_reply: str = (
+        "Sorry, I couldn't listen to that voice note. Please type your "
+        "message, or send a shorter voice note. / عذراً، لم أتمكن من الاستماع "
+        "إلى الرسالة الصوتية. يرجى كتابة رسالتك أو إرسال رسالة صوتية أقصر."
+    )
+
     # Agent Core (VS-005). Earlier messages of the conversation sent with each
     # reply, besides the one being answered (plan assumption A8).
     agent_history_messages: int = Field(default=20, ge=0)
@@ -164,7 +210,18 @@ class Settings(BaseSettings):
     # the one deadline with no exit path of ours behind it.
     agent_turn_timeout_seconds: float = Field(default=45.0, gt=0)
 
-    @field_validator("meta_api_version", "meta_api_base_url", "agent_fallback_reply", mode="before")
+    @field_validator(
+        "meta_api_version",
+        "meta_api_base_url",
+        "agent_fallback_reply",
+        # VS-008: the same reason as agent_fallback_reply, one step worse. These
+        # two ARE the failure path - they are what a patient is told when the
+        # audio side could not be made to work - so a blank one means the only
+        # path left to answer them fails too.
+        "voice_note_unclear_reply",
+        "voice_note_failed_reply",
+        mode="before",
+    )
     @classmethod
     def _blank_means_unset(cls, value: Any, info: ValidationInfo) -> Any:
         """Treat an empty string as "not set" for the two settings with real defaults.
@@ -179,6 +236,11 @@ class Settings(BaseSettings):
         only mean "unset", because an empty message is not a reply - and sending
         "" to Meta is a permanent 4xx, so the one path that exists to answer a
         patient when everything else has failed would itself fail.
+
+        VOICE_NOTE_UNCLEAR_REPLY and VOICE_NOTE_FAILED_REPLY (VS-008) are the
+        same argument one step further in: they are themselves the failure path
+        for a voice note, so a blank one means a patient whose voice note we
+        could not hear gets nothing at all while the job dead-letters.
 
         Deliberately NOT applied to the credentials: an empty META_ACCESS_TOKEN
         must stay empty, because "not configured" has to mean "every send fails
@@ -196,6 +258,21 @@ class Settings(BaseSettings):
         job" cannot be broken by setting one of two independent knobs.
         """
         return self.job_timeout_seconds + self.job_lease_margin_seconds
+
+    @property
+    def voice_note_budget_seconds(self) -> float:
+        """Worst case for the whole voice step: two media calls and one transcription.
+
+        Derived, like claim_lease_seconds: job_timeout_seconds has to cover this
+        plus the turn plus the send, and a reader should not have to add three
+        numbers up by hand to see whether it does.
+
+        Two media calls, because the lookup and the download each get the whole
+        meta_media_timeout_seconds - a media URL lives five minutes, so they run
+        back to back with nothing between them, but each one is its own attempt
+        with its own deadline.
+        """
+        return 2 * self.meta_media_timeout_seconds + self.openai_transcribe_timeout_seconds
 
     @property
     def reply_to_types(self) -> frozenset[str]:

@@ -43,8 +43,10 @@ def startup_warnings(settings: Settings) -> list[str]:
     never secrets (hard rule 9).
 
     Without the first two, "every reply is the fallback" looks like a bug rather
-    than a missing .env entry. Without the third, a slow reply is cut off by
-    arq's job timeout and stranded with no dead letter (plan assumption A14).
+    than a missing .env entry; without the third (VS-008), "every voice note is
+    answered with please-type-your-message" looks like one too. Without the
+    budget check, a slow reply - or now a slow voice note - is cut off by arq's
+    job timeout and stranded with no dead letter (plan assumption A14).
 
     Warnings rather than a boot failure, deliberately: VS-004's assumption A1
     chose a loud runtime signal over a dead process for configuration mistakes,
@@ -55,17 +57,36 @@ def startup_warnings(settings: Settings) -> list[str]:
         warnings.append("OPENAI_API_KEY is not set: every reply will be AGENT_FALLBACK_REPLY")
     if not settings.openai_chat_model.strip():
         warnings.append("OPENAI_CHAT_MODEL is not set: every reply will be AGENT_FALLBACK_REPLY")
-    # Decision D4: the job must cover the WHOLE tool loop plus the one send.
-    # OPENAI_TIMEOUT_SECONDS is deliberately not in this sum - it bounds one
-    # model call, and every model call happens inside the turn budget. Naming it
-    # here would point an operator at the wrong knob.
-    budget = settings.agent_turn_timeout_seconds + settings.meta_send_timeout_seconds
+    # VS-008. The symptom of a missing audio model is indirect - every voice
+    # note is answered with "please type your message", which reads like a
+    # transcription that keeps failing rather than a name nobody set.
+    if not settings.openai_transcribe_model.strip():
+        warnings.append(
+            "OPENAI_TRANSCRIBE_MODEL is not set: every voice note will be answered "
+            "with VOICE_NOTE_FAILED_REPLY"
+        )
+    # Decision D4, extended by VS-008: the job must cover the voice step, the
+    # WHOLE tool loop and the one send. ONE check and ONE message for the whole
+    # relation rather than two - a second warning about a second half of the
+    # same sum would have an operator fix one number and leave the other - so
+    # the message names every knob that feeds it.
+    #
+    # OPENAI_TIMEOUT_SECONDS is deliberately still not in this sum: it bounds
+    # one model call, and every model call happens inside the turn budget.
+    # Naming it here would point an operator at the wrong knob.
+    budget = (
+        settings.voice_note_budget_seconds
+        + settings.agent_turn_timeout_seconds
+        + settings.meta_send_timeout_seconds
+    )
     if settings.job_timeout_seconds <= budget:
         warnings.append(
-            f"JOB_TIMEOUT_SECONDS={settings.job_timeout_seconds:g} does not exceed "
-            f"AGENT_TURN_TIMEOUT_SECONDS={settings.agent_turn_timeout_seconds:g} + "
-            f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g}: "
-            "a slow reply can be cut off mid-send"
+            f"JOB_TIMEOUT_SECONDS={settings.job_timeout_seconds:g} does not exceed the voice "
+            f"step (2 x META_MEDIA_TIMEOUT_SECONDS={settings.meta_media_timeout_seconds:g} + "
+            f"OPENAI_TRANSCRIBE_TIMEOUT_SECONDS={settings.openai_transcribe_timeout_seconds:g})"
+            f" + AGENT_TURN_TIMEOUT_SECONDS={settings.agent_turn_timeout_seconds:g} + "
+            f"META_SEND_TIMEOUT_SECONDS={settings.meta_send_timeout_seconds:g} = {budget:g}: "
+            "a voice note or a slow reply can be cut off with no dead letter"
         )
     # Q8, and risk R8: the real danger in this slice is fake availability
     # reaching a real patient. VS-011 adds the BOOKING_CLIENT switch and the

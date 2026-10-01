@@ -36,6 +36,11 @@ def _settings(**overrides) -> Settings:
         "redis_url": "redis://cache:6379/1",
         "openai_api_key": "sk-test-not-a-real-one",
         "openai_chat_model": "test-model",
+        # VS-008. "Fully configured" now includes an audio model, because
+        # without one every voice note is answered with VOICE_NOTE_FAILED_REPLY
+        # and that gets its own warning. Set here rather than in one test, so
+        # every warning test keeps asking about the warning it names.
+        "openai_transcribe_model": "transcribe-model-not-a-real-one",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -80,7 +85,10 @@ def test_startup_warns_when_the_job_timeout_cannot_cover_the_turn_and_the_send()
     for fragment in ("50", "AGENT_TURN_TIMEOUT_SECONDS=45", "META_SEND_TIMEOUT_SECONDS=10"):
         assert fragment in timeout_warning[0], fragment
     # The per-call deadline is deliberately NOT named: it is not in the sum any
-    # more, and naming it would send an operator to the wrong knob.
+    # more, and naming it would send an operator to the wrong knob. Asserted on
+    # a word boundary, because VS-008's OPENAI_TRANSCRIBE_TIMEOUT_SECONDS - a
+    # different knob, and one that IS in the sum - contains neither this name
+    # nor anything an operator could confuse with it.
     assert "OPENAI_TIMEOUT_SECONDS" not in timeout_warning[0]
 
 
@@ -164,6 +172,78 @@ def test_startup_warns_when_the_turn_budget_cannot_fit_a_booking_change():
     assert len(warnings) == 1
     assert "AGENT_TURN_TIMEOUT_SECONDS=8" in warnings[0]
     assert "no booking change can ever start" in warnings[0]
+
+
+# --------------------------------------------------------------------------
+# VS-008: the audio model, and a job timeout that covers the voice step
+# --------------------------------------------------------------------------
+
+
+def test_the_worker_warns_when_the_transcribe_model_is_unset():
+    """Without it, "voice notes never work" looks like a bug in this repo.
+
+    It is a missing .env entry, and the symptom is indirect: every voice note
+    is answered with VOICE_NOTE_FAILED_REPLY, telling the patient to type -
+    which reads like a transcription that keeps failing rather than a model
+    name nobody set. One line per worker start closes that gap.
+
+    A warning and not a boot failure, for the same reason as every other one
+    here: the api must not refuse to boot over a worker knob (VS-005 A14).
+    """
+    warnings = startup_warnings(_settings(openai_transcribe_model=""))
+
+    transcribe = [w for w in warnings if "OPENAI_TRANSCRIBE_MODEL" in w]
+    assert len(transcribe) == 1
+    assert "is not set" in transcribe[0]
+    assert "VOICE_NOTE_FAILED_REPLY" in transcribe[0]
+    # Whitespace is the same mistake with a space in it.
+    assert [
+        w
+        for w in startup_warnings(_settings(openai_transcribe_model="  "))
+        if "OPENAI_TRANSCRIBE_MODEL" in w
+    ]
+
+
+def test_the_worker_warns_when_the_job_timeout_no_longer_covers_the_voice_step():
+    """Plan conflict C5, as the thing that catches a deployment breaking it.
+
+    ONE check and ONE message for the whole relation, extended rather than
+    duplicated: a second warning about a second half of the same sum would
+    make an operator fix one number and leave the other. The message therefore
+    names all four knobs that feed it.
+
+    The case below is the real one: 90 was the default until VS-008 and it is
+    now too small (40 + 45 + 10 = 95), so a .env still pinning 90 must say so
+    at startup rather than strand a voice turn at the ninetieth second with no
+    dead letter.
+    """
+    warnings = startup_warnings(
+        _settings(
+            job_timeout_seconds=90,
+            meta_media_timeout_seconds=10,
+            openai_transcribe_timeout_seconds=20,
+            agent_turn_timeout_seconds=45,
+            meta_send_timeout_seconds=10,
+        )
+    )
+
+    timeout_warning = [w for w in warnings if "JOB_TIMEOUT_SECONDS" in w]
+    assert len(timeout_warning) == 1
+    for fragment in (
+        "90",
+        "META_MEDIA_TIMEOUT_SECONDS=10",
+        "OPENAI_TRANSCRIBE_TIMEOUT_SECONDS=20",
+        "AGENT_TURN_TIMEOUT_SECONDS=45",
+        "META_SEND_TIMEOUT_SECONDS=10",
+        "95",
+    ):
+        assert fragment in timeout_warning[0], fragment
+
+
+def test_the_default_job_timeout_covers_the_voice_step_and_warns_about_nothing():
+    """The defaults are not merely pinned in tests/test_config.py - they are the
+    values a worker actually starts with, and 140 > 95 is why this is silent."""
+    assert [w for w in startup_warnings(_settings()) if "JOB_TIMEOUT_SECONDS" in w] == []
 
 
 async def test_the_worker_builds_one_service_for_both_booking_roles():

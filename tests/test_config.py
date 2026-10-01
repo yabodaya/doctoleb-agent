@@ -220,54 +220,70 @@ def test_the_retry_knobs_have_the_documented_defaults(monkeypatch):
 
 
 def test_the_job_timeout_exceeds_the_turn_budget_and_the_meta_send_together(monkeypatch):
-    """A real constraint, not a tidy coincidence. Plan section 5.2's arithmetic:
+    """A real constraint, not a tidy coincidence. VS-008's arithmetic (plan 5.1):
 
         MAX_MODEL_CALLS (a constant, not a setting)   6   model calls per turn
         OPENAI_TIMEOUT_SECONDS                       30   ONE model call
+        META_MEDIA_TIMEOUT_SECONDS                   10   ONE media call, x2
+        OPENAI_TRANSCRIBE_TIMEOUT_SECONDS            20   ONE transcription
         AGENT_TURN_TIMEOUT_SECONDS                   45   the WHOLE tool loop
         META_SEND_TIMEOUT_SECONDS                    10   the one Meta send
         ---------------------------------------------------------------------
-        network worst case = 45 + 10                 55
-        JOB_TIMEOUT_SECONDS                          90   must be > 55
+        voice step   = 2 x 10 + 20                   40
+        network worst case = 40 + 45 + 10            95
+        JOB_TIMEOUT_SECONDS                         140   must be > 95
         JOB_LEASE_MARGIN_SECONDS                     30
-        claim lease = 90 + 30                       120   > 90
+        claim lease = 140 + 30                      170   > 140
 
-    OPENAI_TIMEOUT_SECONDS drops OUT of this relation in VS-006: every model
-    call now runs INSIDE the turn budget, so the loop, not the per-call
-    deadline, is what the job has to cover. Without the loop deadline the worst
-    case would be 4 x 30s of model calls plus the tools plus the send - 130s or
-    more - and JOB_TIMEOUT_SECONDS would have to exceed that.
+    VS-008 added the voice step - a media lookup, a download and a
+    transcription, all outside the turn budget because the turn has not started
+    yet when they run - so JOB_TIMEOUT_SECONDS rose from 90 to 140 (plan
+    conflict C5). At 90 the worst case was 95, i.e. ABOVE the job timeout.
+
+    OPENAI_TIMEOUT_SECONDS stays OUT of this relation (VS-006): every model
+    call runs INSIDE the turn budget, so the loop, not the per-call deadline,
+    is what the job has to cover.
 
     Why it matters: an arq job that exceeds its timeout is finished as failed
     and never retried, and none of our exit paths run - no dead letter, no lease
     release, nothing re-enqueues the event (verified against arq 0.28). The
     event is simply stranded until its lease expires.
 
-    Both budgets are wall-clock deadlines rather than httpx timeouts, because an
-    httpx timeout is per connection phase and one call can legitimately take
-    several times its value.
+    Every budget here is a wall-clock deadline rather than an httpx timeout,
+    because an httpx timeout is per connection phase and one call can
+    legitimately take several times its value.
     """
     for key in (
         "JOB_TIMEOUT_SECONDS",
         "META_SEND_TIMEOUT_SECONDS",
         "AGENT_TURN_TIMEOUT_SECONDS",
+        "META_MEDIA_TIMEOUT_SECONDS",
+        "OPENAI_TRANSCRIBE_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
     settings = _base_settings()
 
     assert settings.job_timeout_seconds > (
-        settings.agent_turn_timeout_seconds + settings.meta_send_timeout_seconds
+        settings.voice_note_budget_seconds
+        + settings.agent_turn_timeout_seconds
+        + settings.meta_send_timeout_seconds
     )
 
 
 def test_the_turn_budget_and_the_job_timeout_have_their_documented_defaults(monkeypatch):
     """Decision D4 with Q4's numbers, pinned so a change is a visible decision.
 
-    45 seconds is what a patient waits at worst before the fallback; 90 leaves
-    35 seconds for the job's four short transactions - five with VS-007's T1r -
-    once the two network budgets are
-    subtracted. 40/60 was the alternative and leaves only 10.
+    45 seconds is what a patient waits at worst before the fallback, and it did
+    NOT change in VS-008: the voice step sits outside the turn budget, so a
+    voice turn gets the same model budget as a text one (and V15's
+    MIN_SECONDS_FOR_A_BOOKING_CHANGE floor is measured against this same 45).
+
+    JOB_TIMEOUT_SECONDS moved 90 -> 140 in VS-008 (plan conflict C5), because
+    the job now also covers the voice step's 40 seconds: 40 + 45 + 10 = 95,
+    which was ABOVE the old 90. 140 leaves 45 seconds for the job's five or six
+    short transactions (T0, T1, T1a, T1b, T2, and VS-007's T1r on the retry
+    path).
     """
     for key in ("AGENT_TURN_TIMEOUT_SECONDS", "JOB_TIMEOUT_SECONDS"):
         monkeypatch.delenv(key, raising=False)
@@ -275,7 +291,7 @@ def test_the_turn_budget_and_the_job_timeout_have_their_documented_defaults(monk
     settings = _base_settings()
 
     assert settings.agent_turn_timeout_seconds == 45.0
-    assert settings.job_timeout_seconds == 90.0
+    assert settings.job_timeout_seconds == 140.0
 
 
 def test_the_claim_lease_outlives_the_job_timeout(monkeypatch):
@@ -329,6 +345,17 @@ def test_every_new_key_is_present_in_env_example():
         "OPENAI_MAX_OUTPUT_TOKENS",
         "AGENT_HISTORY_MESSAGES",
         "AGENT_FALLBACK_REPLY",
+        # VS-008. OPENAI_TRANSCRIBE_MODEL has been in the example file since the
+        # first commit; this is the first slice in which it is a real setting,
+        # so it joins the parity check. The other five are genuinely new keys,
+        # which is why Task A1 rebuilds the image: .env.example is COPIED into
+        # it, and inside the container this test reads the baked copy.
+        "OPENAI_TRANSCRIBE_MODEL",
+        "OPENAI_TRANSCRIBE_TIMEOUT_SECONDS",
+        "META_MEDIA_TIMEOUT_SECONDS",
+        "VOICE_NOTE_MAX_BYTES",
+        "VOICE_NOTE_UNCLEAR_REPLY",
+        "VOICE_NOTE_FAILED_REPLY",
     ):
         assert f"\n{key}=" in example, key
 
@@ -439,6 +466,23 @@ def test_the_app_boots_from_a_verbatim_copy_of_env_example(monkeypatch):
     assert settings.agent_turn_timeout_seconds == (
         Settings.model_fields["agent_turn_timeout_seconds"].default
     )
+    # VS-008's five new keys, all blank in the example file. The two replies are
+    # the ones that matter most here: a blank VOICE_NOTE_FAILED_REPLY would
+    # make the one path that exists to tell a patient we could not hear them
+    # fail with a permanent 4xx from Meta.
+    assert settings.meta_media_timeout_seconds == (
+        Settings.model_fields["meta_media_timeout_seconds"].default
+    )
+    assert settings.openai_transcribe_timeout_seconds == (
+        Settings.model_fields["openai_transcribe_timeout_seconds"].default
+    )
+    assert settings.voice_note_max_bytes == Settings.model_fields["voice_note_max_bytes"].default
+    assert settings.voice_note_unclear_reply == (
+        Settings.model_fields["voice_note_unclear_reply"].default
+    )
+    assert settings.voice_note_failed_reply == (
+        Settings.model_fields["voice_note_failed_reply"].default
+    )
 
 
 def test_a_blank_numeric_value_means_unset(monkeypatch):
@@ -472,6 +516,14 @@ def test_a_blank_credential_stays_blank(monkeypatch):
         {"agent_turn_timeout_seconds": 0},
         {"openai_max_output_tokens": 0},
         {"agent_history_messages": -1},
+        # VS-008's three numeric knobs, for exactly the same reason. A zero
+        # media timeout cancels the lookup before it starts, so every voice
+        # note would be answered with VOICE_NOTE_FAILED_REPLY; a zero or
+        # negative byte cap refuses every download, including a two-second one.
+        {"meta_media_timeout_seconds": 0},
+        {"openai_transcribe_timeout_seconds": 0},
+        {"voice_note_max_bytes": 0},
+        {"voice_note_max_bytes": -1},
     ],
 )
 def test_nonsense_agent_numbers_are_refused_at_boot(override):
@@ -485,3 +537,240 @@ def test_nonsense_agent_numbers_are_refused_at_boot(override):
     """
     with pytest.raises(ValidationError):
         _base_settings(**override)
+
+
+# --------------------------------------------------------------------------
+# VS-008: the media and transcription budget, and the two code-owned replies
+# --------------------------------------------------------------------------
+
+VOICE_NOTE_KEYS = (
+    "OPENAI_TRANSCRIBE_MODEL",
+    "OPENAI_TRANSCRIBE_TIMEOUT_SECONDS",
+    "META_MEDIA_TIMEOUT_SECONDS",
+    "VOICE_NOTE_MAX_BYTES",
+    "VOICE_NOTE_UNCLEAR_REPLY",
+    "VOICE_NOTE_FAILED_REPLY",
+)
+
+
+def test_the_transcribe_model_has_no_default_and_does_not_block_startup(monkeypatch):
+    """CLAUDE.md: "model names come from env vars, never hardcoded".
+
+    The same rule and the same shape as OPENAI_CHAT_MODEL, and asserted on the
+    FIELD's default so a default smuggled into the class cannot be hidden by a
+    monkeypatched environment. Blank must boot: a developer with no OpenAI
+    account still has to be able to run the worker. What blank costs is one
+    permanent `openai_transcribe_model_unset` per voice note and the patient
+    being told to type instead - never a silent fallback to some model nobody
+    chose, and never a process that will not start.
+    """
+    monkeypatch.delenv("OPENAI_TRANSCRIBE_MODEL", raising=False)
+
+    assert Settings.model_fields["openai_transcribe_model"].default == ""
+    assert _base_settings().openai_transcribe_model == ""
+
+
+def test_the_voice_timeouts_have_the_documented_defaults(monkeypatch):
+    """Plan section 5.1, pinned so a change to the voice budget is deliberate.
+
+    10 seconds for ONE media call, applied separately to the lookup and to the
+    download, so the pair is at most 20. 20 seconds for ONE transcription,
+    which is a guess at a two-minute note on a bad connection and is the
+    number Task B4's real latencies are measured against.
+
+    Both are wall-clock deadlines (`asyncio.timeout`), not httpx timeouts: an
+    httpx timeout applies per connection phase, so one call can legitimately
+    take several times its value.
+    """
+    for key in ("META_MEDIA_TIMEOUT_SECONDS", "OPENAI_TRANSCRIBE_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(key, raising=False)
+
+    settings = _base_settings()
+
+    assert settings.meta_media_timeout_seconds == 10.0
+    assert settings.openai_transcribe_timeout_seconds == 20.0
+    assert settings.meta_media_timeout_seconds > 0
+    assert settings.openai_transcribe_timeout_seconds > 0
+
+
+def test_the_voice_note_size_cap_has_the_documented_default(monkeypatch):
+    """16 MiB, which is Meta's OWN documented maximum for an audio message.
+
+    So this is not a policy we invented: a real voice note cannot exceed it,
+    and the audio endpoint's own request limit (25 MB) is higher still, which
+    makes Meta's number the binding one.
+
+    Its real job is not the honest case at all. It is the only thing standing
+    between a forged payload - or a response that lies about Content-Length -
+    and an unbounded allocation inside the worker (plan risk R5), which is why
+    it is enforced three times: against the declared file_size before a byte is
+    fetched, against the running total while streaming, and by abandoning the
+    stream the moment the total is passed.
+    """
+    monkeypatch.delenv("VOICE_NOTE_MAX_BYTES", raising=False)
+
+    settings = _base_settings()
+
+    assert settings.voice_note_max_bytes == 16 * 1024 * 1024
+    assert settings.voice_note_max_bytes > 0
+
+
+def test_the_voice_replies_are_pinned_in_arabic_and_english(monkeypatch):
+    """The two texts a patient gets when the audio side failed (W5, W6).
+
+    Pinned verbatim, because they are the only replies in the system whose
+    wording is OURS rather than the model's, and because each has one job:
+
+      * the UNCLEAR reply asks for an ACTION - record it again, or type it -
+        because that is the patient's next step, and it claims nothing about
+        the clinic;
+      * the FAILED reply says to type the message or send a shorter one,
+        because "the clinic will get back to you" (AGENT_FALLBACK_REPLY) is
+        simply untrue of a voice note nobody will ever hear.
+
+    Arabic AND English in one message, because the patient's language is
+    unknown until something has been transcribed - and on these two paths
+    nothing was. No French: it would make the message long on a phone screen,
+    and it is a one-setting change if the clinic wants it.
+
+    No digits in either, asserted below for the same reason
+    test_the_prompt_states_no_digits exists: a number in a fixed string is a
+    number nobody can keep correct.
+    """
+    for key in ("VOICE_NOTE_UNCLEAR_REPLY", "VOICE_NOTE_FAILED_REPLY"):
+        monkeypatch.delenv(key, raising=False)
+
+    settings = _base_settings()
+
+    assert settings.voice_note_unclear_reply == (
+        "Sorry, I couldn't hear that voice note clearly. Could you record it "
+        "again or type your message? / عذراً، لم أتمكن من سماع الرسالة الصوتية "
+        "بوضوح. هل يمكنك تسجيلها مرة أخرى أو كتابة رسالتك؟"
+    )
+    assert settings.voice_note_failed_reply == (
+        "Sorry, I couldn't listen to that voice note. Please type your "
+        "message, or send a shorter voice note. / عذراً، لم أتمكن من الاستماع "
+        "إلى الرسالة الصوتية. يرجى كتابة رسالتك أو إرسال رسالة صوتية أقصر."
+    )
+
+    for reply in (settings.voice_note_unclear_reply, settings.voice_note_failed_reply):
+        # Arabic: any character in the Arabic block. English: an ASCII letter.
+        assert any("؀" <= character <= "ۿ" for character in reply)
+        assert any("a" <= character.lower() <= "z" for character in reply)
+        assert not any(character.isdigit() for character in reply)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+@pytest.mark.parametrize("field", ["voice_note_unclear_reply", "voice_note_failed_reply"])
+def test_a_blank_voice_reply_means_the_default(field, blank, monkeypatch):
+    """`_blank_means_unset`, for exactly the reason AGENT_FALLBACK_REPLY is there.
+
+    `.env.example` ships `VOICE_NOTE_UNCLEAR_REPLY=` with no value, so a `.env`
+    copied from it sets the variable to the empty string - and sending "" to
+    Meta is a permanent 4xx. The one path that exists to tell a patient we
+    could not hear them would itself fail, and the patient would get nothing at
+    all while the job dead-lettered.
+
+    Whitespace is covered too, because `env_ignore_empty` drops "" but keeps
+    "   ", which is the same mistake with a space in it.
+    """
+    for key in VOICE_NOTE_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    default = getattr(_base_settings(), field)
+
+    assert getattr(_base_settings(**{field: blank}), field) == default
+    assert default != ""
+
+
+@pytest.mark.parametrize("field", ["voice_note_unclear_reply", "voice_note_failed_reply"])
+def test_a_configured_voice_reply_is_kept_verbatim(field):
+    """The other half of the blank rule: a real value is never touched.
+
+    Not even stripped. A clinic that writes its own wording - in Arabic, in
+    French, with its own punctuation - gets exactly what it wrote, because
+    `_blank_means_unset` only replaces a value that is blank after stripping.
+    """
+    written = "  نص العيادة / the clinic's own words  "
+
+    assert getattr(_base_settings(**{field: written}), field) == written
+
+
+def test_the_voice_budget_is_derived_from_its_three_parts(monkeypatch):
+    """Derived, like claim_lease_seconds, so the invariant cannot be broken by
+    setting one of three independent knobs.
+
+    A reader - and `startup_warnings()` - should not have to add three numbers
+    up by hand to see whether JOB_TIMEOUT_SECONDS still covers the voice step.
+    Two media calls, because the lookup and the download each get the whole
+    META_MEDIA_TIMEOUT_SECONDS.
+    """
+    for key in VOICE_NOTE_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    settings = _base_settings()
+
+    assert settings.voice_note_budget_seconds == (
+        2 * settings.meta_media_timeout_seconds + settings.openai_transcribe_timeout_seconds
+    )
+    assert settings.voice_note_budget_seconds == 40.0
+    # And it MOVES when any one of them does, so it can never go stale.
+    assert _base_settings(meta_media_timeout_seconds=30).voice_note_budget_seconds == 80.0
+    assert _base_settings(openai_transcribe_timeout_seconds=60).voice_note_budget_seconds == 80.0
+
+
+def test_the_job_timeout_covers_the_voice_step_the_turn_and_the_send(monkeypatch):
+    """The whole relation of plan section 5.1, on the defaults: 40 + 45 + 10 = 95 < 140.
+
+    The 45 seconds left over are for the job's own short transactions - T0, T1,
+    T1a, T1b, T2, and VS-007's T1r on the retry path. A job arq times out is
+    finished as failed with none of our exit paths run: no dead letter, no
+    lease release, and the event stranded until its lease expires. That is why
+    this is a test and a startup warning and not a comment.
+    """
+    for key in (
+        "JOB_TIMEOUT_SECONDS",
+        "META_SEND_TIMEOUT_SECONDS",
+        "AGENT_TURN_TIMEOUT_SECONDS",
+        *VOICE_NOTE_KEYS,
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    settings = _base_settings()
+    budget = (
+        settings.voice_note_budget_seconds
+        + settings.agent_turn_timeout_seconds
+        + settings.meta_send_timeout_seconds
+    )
+
+    assert budget == 95.0
+    assert settings.job_timeout_seconds == 140.0
+    assert settings.job_timeout_seconds > budget
+    # And the lease still outlives the bigger job: 140 + 30 = 170.
+    assert settings.claim_lease_seconds == 170.0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"meta_media_timeout_seconds": 60},
+        {"openai_transcribe_timeout_seconds": 100},
+        {"agent_turn_timeout_seconds": 100},
+        {"meta_send_timeout_seconds": 100},
+    ],
+)
+def test_raising_any_one_budget_knob_can_break_the_job_timeout(override):
+    """Why the relation is checked at startup rather than only pinned here.
+
+    Four independent knobs feed it, and raising ANY of them past the job
+    timeout strands events - silently, because nothing fails until a real voice
+    note arrives and takes too long. These are the four cases
+    `startup_warnings()` has to catch, and the worker test asserts it does.
+    """
+    settings = _base_settings(**override)
+    budget = (
+        settings.voice_note_budget_seconds
+        + settings.agent_turn_timeout_seconds
+        + settings.meta_send_timeout_seconds
+    )
+
+    assert settings.job_timeout_seconds <= budget
