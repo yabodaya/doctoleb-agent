@@ -10,15 +10,25 @@ from app.config import get_settings
 # depth against a future SDK version, and against httpcore2's DEBUG traces, which
 # print response headers.
 #
-# httpx keeps INFO: its one line per request names the Meta URL and the status,
-# never a body, and it is useful when a reply does not arrive. httpx2's line for
-# OpenAI adds nothing the job's own "reply generated" line does not say.
+# httpx2's line for OpenAI adds nothing the job's own "reply generated" line
+# does not say.
+#
+# httpx was at INFO until VS-008, for a reason that has stopped being true. Its
+# one line per request prints the full URL, and until this slice every URL we
+# gave httpx was `graph.facebook.com/<version>/<phone_number_id>/messages` - a
+# clinic id and a path, useful when a reply does not arrive and harmless to
+# keep. VS-008 hands the same client a MEDIA URL, which is a short-lived SIGNED
+# link, which is to say a CREDENTIAL: anybody who can read the logs can fetch
+# the patient's audio with it. One line of httpx INFO would undo the whole of
+# why app/channels/whatsapp/media.py never logs, stores or reprs that URL
+# itself (hard rule 8). So httpx joins the others at WARNING, and what replaces
+# that line is media.py's own: an event id, a hostname, a byte count and a code.
 _THIRD_PARTY_FLOORS: dict[str, int] = {
     "openai": logging.WARNING,
     "httpx2": logging.WARNING,
     "httpcore2": logging.WARNING,
     "httpcore": logging.WARNING,
-    "httpx": logging.INFO,
+    "httpx": logging.WARNING,
 }
 
 

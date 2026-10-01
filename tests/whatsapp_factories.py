@@ -43,6 +43,74 @@ def text_message(n: int = 1, body: str = PATIENT_TEXT, **extra: Any) -> dict[str
     return message
 
 
+# --------------------------------------------------------------------------
+# VS-008: voice notes. Synthetic, like everything else in this module.
+# --------------------------------------------------------------------------
+
+MEDIA_ID = "media-id-0000001"
+OGG_MIME = "audio/ogg; codecs=opus"
+# Not a real Ogg stream and not meant to be: no test decodes it, and a real
+# recording in a fixture would be a real person's voice (hard rule 8). Four
+# bytes of the Ogg magic so it is a distinguishable payload, and sixty zeros so
+# it has a length worth asserting on.
+SYNTHETIC_OGG = b"OggS" + bytes(60)
+# What a lookup answers with. The hostname is the one Meta is observed to use
+# and the one MEDIA_HOST_SUFFIXES allows; the query string is nonsense on
+# purpose, because a test asserts it never reaches a log line.
+MEDIA_URL = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=synthetic&ext=1&hash=x"
+
+
+def audio_message(
+    n: int = 1,
+    media_id: str = MEDIA_ID,
+    mime_type: str = OGG_MIME,
+    voice: bool = True,
+    **extra: Any,
+) -> dict[str, Any]:
+    """One inbound voice note, in Meta's shape.
+
+    Meta's `audio` object carries an id, a mime type, a sha256 and `voice` -
+    and, notably, NO duration (plan conflict C15), which is why the cap this
+    repo enforces is a byte cap. `voice` is true for a recorded note and false
+    for an audio file the patient attached; both are a VOICE_NOTE to us.
+    """
+    message: dict[str, Any] = {
+        "from": phone(n),
+        "id": wamid(n),
+        "timestamp": "1730000000",
+        "type": "audio",
+        "audio": {
+            "id": media_id,
+            "mime_type": mime_type,
+            "voice": voice,
+            # Deliberately NOT stored by us (W13): it is a fingerprint of the
+            # patient's audio and buys nothing once the audio is gone.
+            "sha256": f"sha256-of-nothing-{n:08d}",
+        },
+    }
+    message.update(extra)
+    return message
+
+
+def media_lookup_body(
+    url: str = MEDIA_URL,
+    mime_type: str = OGG_MIME,
+    file_size: int | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """What the Graph API answers a media lookup with."""
+    body: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "url": url,
+        "mime_type": mime_type,
+        "sha256": "sha256-of-nothing-00000001",
+        "file_size": len(SYNTHETIC_OGG) if file_size is None else file_size,
+        "id": MEDIA_ID,
+    }
+    body.update(extra)
+    return body
+
+
 def status_update(n: int = 1, state: str = "sent", **extra: Any) -> dict[str, Any]:
     status: dict[str, Any] = {
         "id": wamid(n),

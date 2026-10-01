@@ -47,14 +47,15 @@ def test_debug_does_not_open_the_sdk_or_transport_loggers():
 
     It must not also turn on httpcore2's DEBUG traces, which print response
     headers, or a future SDK version's request logging.
+
+    VS-008 moved `httpx` into this list, from INFO. Its one line per request
+    prints the whole URL, and from this slice one of the URLs we give it is a
+    signed media link - a credential. See the comment in app/logging_config.py.
     """
     configure_logging("DEBUG")
 
-    for name in ("openai", "httpx2", "httpcore2", "httpcore"):
+    for name in ("openai", "httpx2", "httpcore2", "httpcore", "httpx"):
         assert logging.getLogger(name).level >= logging.WARNING, name
-    # httpx keeps INFO: its one line per Meta request names the URL and the
-    # status, never a body, and it is useful when a reply does not arrive.
-    assert logging.getLogger("httpx").level >= logging.INFO
 
 
 def test_a_quieter_root_level_still_wins():
@@ -278,5 +279,72 @@ async def test_a_debug_run_with_tool_calls_logs_nothing_it_should_not():
         for record in collector.records
         if record.levelno < logging.WARNING
         and (record.name.startswith(("openai", "httpx2", "httpcore2")))
+    ]
+    assert noisy == []
+
+
+# --------------------------------------------------------------------------
+# VS-008: the media URL is a credential, and httpx used to print it
+# --------------------------------------------------------------------------
+
+
+async def test_a_debug_media_download_never_logs_the_signed_url():
+    """The leak this slice found, and the reason `httpx` is now at WARNING.
+
+    httpx logs one INFO line per request containing the FULL URL. Until VS-008
+    every URL this repo gave httpx was
+    `graph.facebook.com/<version>/<phone_number_id>/messages` - a clinic id and
+    a path, which is why VS-004 deliberately left httpx at INFO. VS-008 hands
+    the same client a media URL, which is a short-lived SIGNED link: a
+    credential that fetches the patient's audio. One httpx INFO line would have
+    undone the whole of why app/channels/whatsapp/media.py never logs, stores or
+    reprs that URL itself.
+
+    Driven through the REAL client with a real `configure_logging("DEBUG")` -
+    the worst case, since DEBUG is what a developer sets while chasing exactly
+    this kind of problem - because the floor is the thing under test and
+    `caplog.at_level` would bypass it.
+
+    The positive control matters as much as the assertion: without it, a
+    collector that captured nothing would make "no leak" pass vacuously.
+    """
+    import httpx
+
+    from app.channels.whatsapp.media import MediaClient
+    from tests.whatsapp_factories import SYNTHETIC_OGG, media_lookup_body
+
+    signed = "https://lookaside.fbsbx.com/attachments/?mid=x&hash=SENTINELSIGNEDLINK"
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pw@db:5432/doctoleb",
+        redis_url="redis://cache:6379/1",
+        meta_access_token="sk-SENTINEL-not-a-real-token",
+    )
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if "lookaside" in request.url.host:
+            return httpx.Response(200, content=SYNTHETIC_OGG)
+        return httpx.Response(200, json=media_lookup_body(url=signed))
+
+    configure_logging("DEBUG")
+    collector = Collector()
+    logging.getLogger().addHandler(collector)
+    logging.getLogger("app.test").debug("positive control")
+
+    client = MediaClient(httpx.AsyncClient(transport=httpx.MockTransport(transport)), settings)
+    looked_up = await client.lookup("media-id-0000001", "100000000000001", event_id="e")
+    assert looked_up.ref is not None
+    assert (await client.download(looked_up.ref, event_id="e")).succeeded
+
+    lines = [record.getMessage() for record in collector.records]
+    assert "positive control" in lines
+    for sentinel in ("SENTINELSIGNEDLINK", "sk-SENTINEL-not-a-real-token", "hash="):
+        assert not any(sentinel in line for line in lines), sentinel
+    # And httpx is silent below WARNING, which is what makes the above true for
+    # every future URL rather than only for the two in this test.
+    noisy = [
+        record.name
+        for record in collector.records
+        if record.levelno < logging.WARNING and record.name.startswith(("httpx", "httpcore"))
     ]
     assert noisy == []
