@@ -20,6 +20,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+import httpx
 import httpx2
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -76,3 +77,26 @@ def no_real_http2_transport(monkeypatch):
         raise RuntimeError("a test tried to reach the network through httpx2")
 
     monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_http_transport(monkeypatch):
+    """No test may reach Meta either (VS-008, plan conflict C10).
+
+    The sibling fixture above blocks httpx2, which is what the OpenAI SDK uses.
+    The Meta sender and VS-008's media client use httpx - a different package -
+    so until this fixture existed a test that forgot a MockTransport would have
+    tried to reach graph.facebook.com with whatever token was in the
+    developer's environment. That matters more from this slice on: the media
+    client sends the access token to a host it read out of a response body, so
+    "no test reaches the real transport" is part of how the token stays ours.
+
+    MockTransport and ASGITransport are different classes, so replacing this
+    one method leaves every existing test untouched - the whole suite was run
+    with this in place before it was added (plan P5: 1008 passed).
+    """
+
+    async def refuse(self, request):
+        raise RuntimeError("a test tried to reach the network through httpx")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
